@@ -57,11 +57,10 @@ def strip_think(text: str) -> str:
 
 
 def call_gemini(prompt: str) -> tuple[str, float]:
-    import google.generativeai as genai
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    from google import genai
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     t0 = time.time()
-    resp = model.generate_content(prompt)
+    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     elapsed = time.time() - t0
     return (resp.text or "").strip(), elapsed
 

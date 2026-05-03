@@ -1,13 +1,13 @@
 # Claude AI Trading Bot
 
-A fully automated multi-symbol perpetual trading bot for **Hyperliquid**, with a
-multi-round dual-AI pipeline (Gemini + MiniMax) that:
+A fully automated multi-symbol perpetual trading bot for **Hyperliquid** that:
 
-1. Scores broad crypto sentiment from 6 free RSS feeds + Fear & Greed Index +
-   on-chain context (BTC dominance, funding rates).
-2. Tunes position sizing in real time based on that sentiment.
-3. Runs every BUY/SELL signal through a **dual-AI trade gate** (Gemini AND
-   MiniMax must both approve) before placing the order.
+1. Uses **MiniMax** to score broad crypto sentiment every 15 min from 6 free
+   RSS feeds + Fear & Greed Index + on-chain context (BTC dominance, funding
+   rates), then tunes position sizing accordingly.
+2. Runs every BUY/SELL signal through a **dual-AI trade gate** (Gemini AND
+   MiniMax in parallel) before placing the order — both must approve, with
+   single-AI fallback if one is unavailable.
 
 Trades **SOL, ETH, ADA** simultaneously with independent per-symbol position
 limits.
@@ -21,10 +21,8 @@ limits.
 │                       Every 15 minutes                           │
 │                                                                  │
 │  ┌──────────────┐                                               │
-│  │ ai_analyst   │  Round 1 (parallel)                           │
-│  │   .run_once  │   ├─ Gemini  ─┐                               │
-│  │              │   └─ MiniMax ─┤                               │
-│  │              │                ▼                              │
+│  │ ai_analyst   │  Round 1: MiniMax scores headlines + FNG      │
+│  │   .run_once  │                ▼                              │
 │  │              │  Round 2 (supplementary data)                 │
 │  │              │   ├─ BTC dominance (CoinGecko)                │
 │  │              │   ├─ SOL/ETH/ADA funding (Hyperliquid)        │
@@ -49,8 +47,8 @@ limits.
 │     check kill switch                                            │
 │     for symbol in [SOL, ETH, ADA]:                               │
 │       fetch 1m closes → compute RSI(14)                          │
-│       if RSI < 20 → BUY signal                                   │
-│       if RSI > 80 → SELL signal                                  │
+│       if RSI < 25 → BUY signal                                   │
+│       if RSI > 75 → SELL signal                                  │
 │       if BUY/SELL:                                               │
 │         ┌────── Trade Gate (dual AI consensus) ──────┐          │
 │         │  Gemini  ─┐                                │          │
@@ -65,7 +63,7 @@ limits.
 | File | Role |
 |---|---|
 | `bot.py` | Main 60-second tick loop, multi-symbol orchestration |
-| `strategy.py` | RSI(14) signal — locked thresholds 20/80 |
+| `strategy.py` | RSI(14) signal — locked thresholds 25/75 |
 | `exchange.py` | Hyperliquid SDK wrapper |
 | `risk.py` | Account-level drawdown kill switch |
 | `ai_analyst.py` | 3-round AI pipeline (Gemini + MiniMax + supplementary data) |
@@ -141,8 +139,8 @@ python compare_ai.py 5    # 5 runs each, prints mean/stdev/latency
 | `LOOP_SECONDS` | `60` | Bot tick interval |
 | `CANDLE_INTERVAL` | `"1m"` | Candle resolution feeding RSI |
 | `RSI_PERIOD` | `14` | Wilder RSI lookback |
-| `RSI_OVERSOLD` | `20.0` | **Locked** — RSI below this → BUY signal |
-| `RSI_OVERBOUGHT` | `80.0` | **Locked** — RSI above this → SELL signal |
+| `RSI_OVERSOLD` | `25.0` | **Locked** — RSI below this → BUY signal |
+| `RSI_OVERBOUGHT` | `75.0` | **Locked** — RSI above this → SELL signal |
 | `USE_TESTNET` | `False` | Switch to Hyperliquid testnet |
 | `DEMO_FAKE_LOSS` | `False` | Force kill switch on second tick (testing only) |
 | `AI_REFRESH_SECONDS` | `900` | How often `ai_analyst.run_once()` runs (15 min) |
@@ -180,20 +178,23 @@ This is the heart of the bot. Decisions happen at two cadences:
 
 ### A. Sentiment refresh (every 15 minutes) — `ai_analyst.run_once()`
 
-#### Round 1 — Parallel scoring (Gemini + MiniMax)
+#### Round 1 — MiniMax sentiment scoring
 
-Both models receive the **same input**:
+MiniMax receives:
 - 15 deduped headlines, **balanced 5-per-source** across Cointelegraph, CoinDesk,
   TheBlock, CryptoSlate, BitcoinMagazine, Bitcoinist (no API tokens required).
 - Latest **Fear & Greed Index** (`alternative.me`).
 - Per-symbol market state: price, 24h change, current RSI, position, funding rate.
 
-Each returns:
+Returns:
 ```
 SCORE: 1-10        (1 extreme bear, 10 extreme bull)
 CONFIDENCE: 0-1
 REASON: one short sentence
 ```
+
+> Gemini is intentionally **not** used in the cycle — it's reserved for the
+> per-trade gate, where its 20-RPD free-tier limit is unlikely to bite.
 
 #### Round 2 — Supplementary data fetch
 
@@ -203,10 +204,11 @@ REASON: one short sentence
 
 #### Round 3 — MiniMax judge × N (median)
 
-A separate prompt feeds **both Round 1 results** + Round 2 supplements +
+A separate prompt feeds the **Round 1 result** + Round 2 supplements +
 per-symbol state to MiniMax `JUDGE_MULTI_SHOT` times (default 3). The judge
-weighs the analyst views, penalises bullishness when BTC dominance is climbing
-or funding is crowded long, and produces a single decisive call.
+re-evaluates the analyst view against the fresh data — penalising bullishness
+when BTC dominance is climbing or funding is crowded long — and produces a
+single decisive call.
 
 The N runs are aggregated:
 - `score`, `confidence` → median of successful runs.
@@ -226,12 +228,12 @@ otherwise (neutral)           → mult=1.0,  loss=2%
 
 Final per-symbol order USD = `BASE_TRADE_SIZE_USD[symbol] × TRADE_SIZE_MULTIPLIER`.
 
-> **RSI thresholds are locked at 20 / 80 in `config.py`** and intentionally not
+> **RSI thresholds are locked at 25 / 75 in `config.py`** and intentionally not
 > AI-tunable. The AI controls *how big* and *how risky* — not *when* to enter.
 
 ### B. Trade gate (every signal) — `trade_gate.judge_trade()`
 
-Whenever any symbol's 1m RSI crosses 20 or 80, that **specific symbol's**
+Whenever any symbol's 1m RSI crosses 25 or 75, that **specific symbol's**
 context is sent to a dual-AI gate:
 
 ```
@@ -245,11 +247,19 @@ Gemini  ─┐
          │ both called in parallel
 MiniMax ─┘
             ↓
-  Strict consensus rule:
-   - both GO         → place order
-   - any one SKIP    → skip this tick (re-evaluate next minute)
-   - both fail       → fallback GO (preserve operational safety)
+  Decision rule:
+   - both responded, both GO        → place order
+   - both responded, any one SKIP   → skip this tick
+   - only one responded             → that one's decision is authoritative
+   - both failed                    → SKIP (no AI signal)
 ```
+
+> **Gemini billing note**: the free tier of `gemini-2.5-flash` only allows
+> 20 requests per day, far below this bot's usage. To make the consensus rule
+> actually run on every call, enable billing on the Google Cloud project
+> linked to your `GEMINI_API_KEY` (Tier 1 pay-as-you-go, ~$0.50 / month at
+> the default refresh schedule). Without billing the gate gracefully degrades
+> to MiniMax-only via the fallback path above.
 
 Gate prompt heuristics (built into `trade_gate.py`):
 - SKIP if signal disagrees with strong-confidence sentiment.
@@ -268,15 +278,16 @@ Per typical hour with default settings:
 
 | Path | Calls/hr | Daily | Notes |
 |---|---|---|---|
-| Round 1 Gemini | 4 | 96 | One per refresh |
 | Round 1 MiniMax | 4 | 96 | One per refresh |
 | Round 3 MiniMax × 3 | 12 | 288 | Median aggregation |
-| Trade gate Gemini | ~5–15 | ~120–360 | Only when RSI hits extremes |
-| Trade gate MiniMax | ~5–15 | ~120–360 | Same trigger |
+| Trade gate MiniMax | ~5–15 | ~120–360 | Only when RSI hits 25/75 extremes |
+| Trade gate Gemini | ~5–15 | ~120–360 | Same trigger as above |
 
 - **MiniMax**: ~25 calls/hr → 125 / 5 hr. Comfortably within the 1500 / 5 hr
   Starter quota (~8% utilisation).
-- **Gemini 2.5 Flash**: ~10–20 calls/hr. Well within the free-tier RPD.
+- **Gemini 2.5 Flash**: ~5–15 calls/hr is **above the 20-RPD free-tier ceiling**.
+  Without billing enabled, Gemini will 429 most of the time and the trade gate
+  silently degrades to MiniMax-only via the single-respondent fallback.
 
 ---
 
@@ -299,7 +310,7 @@ The only function you need to change to swap strategies is
 `strategy.decide(closes, settings) -> (Signal, info_dict)`. Keep the
 signature, return one of `"BUY"` / `"SELL"` / `"HOLD"`.
 
-The current implementation is locked-threshold RSI(14) at 20/80; consider this
+The current implementation is locked-threshold RSI(14) at 25/75; consider this
 a thin reference, not a recommendation. The AI layer is independent of the
 strategy and will keep working with any signal source.
 

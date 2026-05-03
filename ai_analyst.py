@@ -259,11 +259,11 @@ def _build_judge_prompt(round1_results: list[tuple[str, dict]], headlines: list[
         for name, r in round1_results
     )
 
-    return f"""You are the FINAL JUDGE synthesizing two analysts' opinions plus
-fresh macro data into ONE shared parameter decision for a multi-symbol perp bot
-trading the basket [{symbols_str}].
+    return f"""You are the FINAL JUDGE re-evaluating an initial analyst opinion
+against fresh macro/on-chain data, producing ONE shared parameter decision for a
+multi-symbol perp bot trading the basket [{symbols_str}].
 
-=== Analyst opinions (Round 1) ===
+=== Initial analyst opinion (Round 1) ===
 {r1_summary}
 
 === Macro & on-chain (Round 2) ===
@@ -279,18 +279,19 @@ trading the basket [{symbols_str}].
 {bullets}
 
 === Your job ===
-Weigh both analyst views. The basket includes alts (SOL, ADA), so penalize
-bullishness when BTC dominance is climbing. Penalize bullishness if multiple
-symbols show crowded-long funding. Reward bearishness if multiple symbols are
+Re-examine the analyst view against the fresh data. The basket includes alts
+(SOL, ADA), so penalize bullishness when BTC dominance is climbing. Penalize
+bullishness if multiple symbols show crowded-long funding. Reward bearishness
+if multiple symbols are
 already RSI-stretched in the opposite direction of the news.
 
-Be more decisive than either analyst alone (use supplementary data to break
-ties), but stay within the same output schema.
+Be more decisive than the initial analyst alone (use supplementary data to
+sharpen the call). Stay within the same output schema.
 
 Output strictly three lines:
 SCORE: <integer 1-10>
 CONFIDENCE: <decimal 0.0-1.0>
-REASON: <one short sentence including which analyst you weighted more and why>
+REASON: <one short sentence on what shifted vs the initial analyst view>
 """
 
 
@@ -321,14 +322,13 @@ def call_gemini(prompt: str, max_tokens: int = 500) -> Optional[dict]:
         log.warning("GEMINI_API_KEY not set")
         return None
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError:
-        log.error("google-generativeai not installed")
+        log.error("google-genai not installed — run pip install -r requirements.txt")
         return None
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(config.GEMINI_MODEL)
-        resp = model.generate_content(prompt)
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(model=config.GEMINI_MODEL, contents=prompt)
         return _parse_output((resp.text or "").strip())
     except Exception as e:
         log.error(f"Gemini call failed: {e}")
@@ -350,7 +350,7 @@ def call_minimax(prompt: str, max_tokens: int = 2000) -> Optional[dict]:
                 "max_tokens": max_tokens,
                 "temperature": 0.3,
             },
-            timeout=60,
+            timeout=120,
         )
         resp.raise_for_status()
         text = resp.json()["choices"][0]["message"]["content"]
@@ -362,11 +362,9 @@ def call_minimax(prompt: str, max_tokens: int = 2000) -> Optional[dict]:
 
 # ---------- Round orchestration ----------
 
-def _round1_parallel(prompt: str) -> tuple[Optional[dict], Optional[dict]]:
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_g = pool.submit(call_gemini, prompt)
-        f_m = pool.submit(call_minimax, prompt)
-        return f_g.result(), f_m.result()
+def _round1_minimax(prompt: str) -> Optional[dict]:
+    """Round 1 is MiniMax only — Gemini is reserved for the trade gate."""
+    return call_minimax(prompt)
 
 
 def _round3_judge(round1: list[tuple[str, dict]], headlines, fng, btc_dom,
@@ -380,8 +378,8 @@ def _round3_judge(round1: list[tuple[str, dict]], headlines, fng, btc_dom,
             results.append(r)
             log.info(f"Judge shot {i+1}/{n}: score={r['score']} conf={r['confidence']:.2f}")
     if not results:
-        log.warning("All MiniMax judge shots failed; falling back to Gemini judge.")
-        return call_gemini(prompt)
+        log.warning("All MiniMax judge shots failed; AI cycle skipped.")
+        return None
 
     scores = [r["score"] for r in results]
     confs = [r["confidence"] for r in results]
@@ -425,27 +423,22 @@ def run_once(market_ctx: Optional[dict] = None, client=None) -> Optional[int]:
         f"BTC_dom={btc_dom} | funding={funding_rates}"
     )
 
-    # Round 1: parallel scoring
+    # Round 1: MiniMax-only (Gemini reserved for trade gate)
     r1_prompt = _build_round1_prompt(headlines, fng, market_ctx)
-    gemini_r, minimax_r = _round1_parallel(r1_prompt)
-    log.info(f"Round 1: gemini={gemini_r and gemini_r['score']}/10 "
-             f"minimax={minimax_r and minimax_r['score']}/10")
+    minimax_r = _round1_minimax(r1_prompt)
+    log.info(f"Round 1: minimax={minimax_r and minimax_r['score']}/10")
 
-    round1: list[tuple[str, dict]] = []
-    if gemini_r:
-        round1.append(("Gemini", gemini_r))
-    if minimax_r:
-        round1.append(("MiniMax", minimax_r))
-
-    if not round1:
-        log.warning("AI cycle skipped: both Round 1 analysts failed.")
+    if minimax_r is None:
+        log.warning("AI cycle skipped: MiniMax Round 1 failed.")
         return None
 
-    # Round 3: MiniMax judge (multi-shot, with Gemini fallback inside)
+    round1: list[tuple[str, dict]] = [("MiniMax", minimax_r)]
+
+    # Round 3: MiniMax judge (multi-shot, median)
     final = _round3_judge(round1, headlines, fng, btc_dom, funding_rates, market_ctx)
     if final is None:
-        log.warning("AI cycle: judge failed; using Round 1 best (highest confidence).")
-        final = max((r for _, r in round1), key=lambda r: r["confidence"])
+        log.warning("AI cycle: judge failed; falling back to Round 1 result.")
+        final = minimax_r
 
     params = _build_params(final)
     log.info(

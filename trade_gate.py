@@ -1,12 +1,15 @@
 """Pre-trade dual-AI confirmation gate.
 
-For every BUY/SELL the bot wants to execute we ask BOTH Gemini and MiniMax in
-parallel. Strict consensus rule: BOTH must say GO, otherwise SKIP.
+For every BUY/SELL the bot wants to execute we ask Gemini and MiniMax in
+parallel. The decision rule is:
 
-Failure handling:
-- Both AIs return: apply consensus rule.
-- Only one returns: that single decision is used.
-- Both fail: GO (fallback — gate is an additive filter, not a kill switch).
+  - 2 responded:  both must GO -> execute, otherwise SKIP
+  - 1 responded:  that one's decision is authoritative
+  - 0 responded:  SKIP (no AI signal)
+
+Claude (Sonnet) is wired up via `_call_claude` and `config.CLAUDE_MODEL` and can
+be re-enabled by adding it to the parallel pool in `judge_trade` once the
+Anthropic account has credit.
 """
 import os
 import re
@@ -94,7 +97,7 @@ def _call_minimax(prompt: str) -> Optional[tuple[str, str]]:
                 "max_tokens": 1500,
                 "temperature": 0.2,
             },
-            timeout=30,
+            timeout=120,
         )
         resp.raise_for_status()
         text = ai_analyst._strip_think(resp.json()["choices"][0]["message"]["content"])
@@ -109,44 +112,78 @@ def _call_gemini(prompt: str) -> Optional[tuple[str, str]]:
     if not key:
         return None
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel(config.GEMINI_MODEL)
-        resp = model.generate_content(prompt)
+        from google import genai
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(model=config.GEMINI_MODEL, contents=prompt)
         return _parse((resp.text or "").strip())
     except Exception as e:
         log.warning(f"Trade gate Gemini failed: {e}")
         return None
 
 
-def judge_trade(signal: str, ctx: dict[str, Any]) -> tuple[bool, str, str]:
-    """Returns (allow, source_label, combined_reason).
+def _call_claude(prompt: str) -> Optional[tuple[str, str]]:
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=key)
+        resp = client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        # resp.content is a list of content blocks; first text block holds the answer.
+        text_parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+        return _parse("\n".join(text_parts).strip())
+    except Exception as e:
+        log.warning(f"Trade gate Claude failed: {e}")
+        return None
 
-    Calls both AIs in parallel. STRICT CONSENSUS: both must say GO.
-    Single-AI fallback if the other fails. Both fail -> GO (operational safety).
+
+def _decide_quorum(votes: dict[str, tuple[str, str]]) -> tuple[bool, str]:
+    """Apply the agreed quorum rule to the responding analysts.
+
+    votes: { 'gemini' | 'minimax' : ('GO'|'SKIP', reason) }
+
+    Returns (allow, rationale_text).
     """
+    n = len(votes)
+
+    if n == 0:
+        return False, "both AIs failed; skipping for safety"
+
+    if n == 1:
+        only = next(iter(votes))
+        d, r = votes[only]
+        return d == "GO", f"only {only} responded; using its call ({d}): {r}"
+
+    # n == 2: both must GO.
+    all_go = all(d == "GO" for d, _ in votes.values())
+    return all_go, ("both analysts said GO" if all_go
+                    else "consensus broken (need both GO)")
+
+
+def judge_trade(signal: str, ctx: dict[str, Any]) -> tuple[bool, str, str]:
+    """Returns (allow, source_label, combined_reason)."""
     prompt = _build_prompt(signal, ctx)
     symbol = ctx.get("symbol", "?")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f_m = pool.submit(_call_minimax, prompt)
         f_g = pool.submit(_call_gemini, prompt)
-        m_result = f_m.result()
-        g_result = f_g.result()
+        f_m = pool.submit(_call_minimax, prompt)
+        g_r, m_r = f_g.result(), f_m.result()
 
-    parts: list[tuple[str, str, str]] = []  # (label, decision, reason)
-    if m_result is not None:
-        parts.append(("minimax", m_result[0], m_result[1]))
-    if g_result is not None:
-        parts.append(("gemini", g_result[0], g_result[1]))
+    votes: dict[str, tuple[str, str]] = {}
+    if g_r is not None:
+        votes["gemini"] = g_r
+    if m_r is not None:
+        votes["minimax"] = m_r
 
-    if not parts:
-        log.warning(f"[{symbol}] Trade gate: both AIs failed — defaulting to GO.")
-        return True, "fallback-go", "AI unavailable"
+    allow, rationale = _decide_quorum(votes)
+    src = "+".join(votes.keys()) or "none"
+    per_vote = " | ".join(f"{n}={d}: {r}" for n, (d, r) in votes.items()) or "(no responses)"
+    final_reason = f"{rationale} || {per_vote}"
 
-    # Strict consensus: every present analyst must say GO.
-    allow = all(d == "GO" for _, d, _ in parts)
-    src = "+".join(label for label, _, _ in parts)
-    reasons = " | ".join(f"{lbl}={d}: {r}" for lbl, d, r in parts)
-    log.info(f"[{symbol}] Trade gate [{src}] {'GO' if allow else 'SKIP'} on {signal} — {reasons}")
-    return allow, src, reasons
+    log.info(f"[{symbol}] Trade gate [{src}] -> {'GO' if allow else 'SKIP'} on {signal} | {rationale}")
+    return allow, src, final_reason

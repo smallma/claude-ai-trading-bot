@@ -26,8 +26,8 @@ RSI_PERIOD = 14
 
 # RSI thresholds are LOCKED — AI cannot tune them. Only triggers entries when
 # the market is at a true extreme. Same for all symbols.
-RSI_OVERSOLD = 20.0
-RSI_OVERBOUGHT = 80.0
+RSI_OVERSOLD = 25.0
+RSI_OVERBOUGHT = 75.0
 
 USE_TESTNET = False  # MAINNET — real money
 
@@ -42,6 +42,7 @@ AI_REFRESH_SECONDS = 900
 # Models
 GEMINI_MODEL = "gemini-2.5-flash"
 MINIMAX_MODEL = "MiniMax-M2.7"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Round 3 judge: how many times to call MiniMax and take the median score.
 JUDGE_MULTI_SHOT = 3

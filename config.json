@@ -2,15 +2,15 @@
   "TRADE_SIZE_MULTIPLIER": 1.0,
   "DAILY_LOSS_LIMIT": 0.02,
   "ai_meta": {
-    "last_sentiment": 4,
-    "last_confidence": 0.7,
-    "last_updated": "2026-05-03T12:57:40.478814+00:00",
-    "last_reason": "Weighted Gemini's bearish outlook more heavily because its higher confidence (0.70) aligns with rising BTC dominance and cautionary macro headlines, pushing the overall score to a bearish 4.",
+    "last_sentiment": 5,
+    "last_confidence": 0.58,
+    "last_updated": "2026-05-03T13:15:23.786887+00:00",
+    "last_reason": "Weighted macro signals more, lowering the score due to rising BTC dominance and regulatory headwinds.",
     "last_fng": {
       "value": 47,
       "classification": "Neutral"
     },
-    "btc_dominance": 58.47949952949209,
+    "btc_dominance": 58.47159543206458,
     "funding_rates": {
       "SOL": null,
       "ETH": null,
@@ -18,13 +18,9 @@
     },
     "headline_count": 15,
     "round1": {
-      "Gemini": {
-        "score": 4,
-        "confidence": 0.7
-      },
       "MiniMax": {
         "score": 6,
-        "confidence": 0.6
+        "confidence": 0.62
       }
     },
     "judge_shots": 3,
