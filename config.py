@@ -1,24 +1,50 @@
-"""Central configuration. Tweak constants here, not in other modules."""
+"""Static configuration. Values that should NEVER be touched by the AI live here.
 
-SYMBOL = "SOL"
-TRADE_SIZE_USD = 12.0
-MAX_OPEN_POSITIONS = 1
+Dynamic, AI-tunable parameters (TRADE_SIZE_MULTIPLIER, RSI thresholds, DAILY_LOSS_LIMIT)
+have moved to config.json — see settings.py.
 
-# Kill switch: halt if equity drops by this fraction from the bot's STARTING equity
-# (anchored once at startup, not reset daily).
-DAILY_LOSS_LIMIT = 0.02  # 2%
+Per-symbol BASE size is static; AI scales it with TRADE_SIZE_MULTIPLIER (typ. 0.4-1.25x).
+"""
+
+SYMBOLS = ["SOL", "ETH", "ADA"]
+
+# Per-symbol base trade size in USD. Actual order size = BASE * TRADE_SIZE_MULTIPLIER.
+BASE_TRADE_SIZE_USD = {
+    "SOL": 40.0,
+    "ETH": 40.0,
+    "ADA": 20.0,
+}
+
+# Max simultaneous open positions PER SYMBOL (each symbol tracked independently).
+MAX_OPEN_POSITIONS_PER_SYMBOL = 1
 
 LOOP_SECONDS = 60
 CANDLE_INTERVAL = "1m"
 CANDLE_LOOKBACK = 100
 
 RSI_PERIOD = 14
-RSI_OVERSOLD = 30.0
-RSI_OVERBOUGHT = 70.0
+
+# RSI thresholds are LOCKED — AI cannot tune them. Only triggers entries when
+# the market is at a true extreme. Same for all symbols.
+RSI_OVERSOLD = 20.0
+RSI_OVERBOUGHT = 80.0
 
 USE_TESTNET = False  # MAINNET — real money
 
 # Demo flag: when True, after the first tick the bot reports equity as 99% of
-# starting equity, forcing the kill switch to trip and proving the
-# close-then-halt mechanics work end-to-end. Always set False in real runs.
+# starting equity, forcing the kill switch to trip. Keep False in real runs.
 DEMO_FAKE_LOSS = False
+
+# How often the AI module refreshes the news-sentiment score and rewrites
+# config.json. 15min: fast enough to ride sentiment shifts, well within free quotas.
+AI_REFRESH_SECONDS = 900
+
+# Models
+GEMINI_MODEL = "gemini-2.5-flash"
+MINIMAX_MODEL = "MiniMax-M2.7"
+
+# Round 3 judge: how many times to call MiniMax and take the median score.
+JUDGE_MULTI_SHOT = 3
+
+# Trade gate: AI confirmation before placing orders. False = pure RSI; True = must pass AI gate.
+TRADE_GATE_ENABLED = True
