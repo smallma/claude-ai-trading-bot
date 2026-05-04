@@ -29,6 +29,22 @@ RSI_PERIOD = 14
 RSI_OVERSOLD = 25.0
 RSI_OVERBOUGHT = 75.0
 
+# EMA trend filter (fast vs slow). EMA_FAST > EMA_SLOW = bull regime.
+EMA_FAST_PERIOD = 9
+EMA_SLOW_PERIOD = 21
+
+# Bollinger Bands (period, stdev multiplier). Used as breakout entry trigger.
+BB_PERIOD = 20
+BB_STDEV = 2.0
+
+# Trailing stop tiers (ROE% based, computed as unrealizedPnl / marginUsed).
+# When max-seen ROE crosses TIER_ARM, the stop floor becomes TIER_FLOOR.
+# A position closes when current ROE drops to the floor it has armed.
+TRAILING_TIERS = [
+    (15.0, 0.0),    # ROE >= +15% arms breakeven
+    (30.0, 15.0),   # ROE >= +30% arms +15% lock-in
+]
+
 USE_TESTNET = False  # MAINNET — real money
 
 # Demo flag: when True, after the first tick the bot reports equity as 99% of

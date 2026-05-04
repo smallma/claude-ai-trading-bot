@@ -1,8 +1,12 @@
 """Main loop. Run with: python bot.py
 
-Multi-symbol: iterates config.SYMBOLS each tick, runs the same RSI strategy
-per coin with shared AI-tuned thresholds. Per-symbol size = BASE_TRADE_SIZE_USD
-× TRADE_SIZE_MULTIPLIER (the latter is what AI scales).
+Multi-symbol: iterates config.SYMBOLS each tick, runs a composite strategy
+(EMA trend + RSI/Bollinger) per coin. Per-symbol size = BASE_TRADE_SIZE_USD
+× TRADE_SIZE_MULTIPLIER (the multiplier is what AI scales).
+
+Trailing stop: monitors per-symbol unrealised ROE every tick. When max-seen
+ROE crosses a tier in config.TRAILING_TIERS, the floor is armed. If current
+ROE drops to the armed floor from above, the position is market-closed.
 """
 import os
 import sys
@@ -21,6 +25,11 @@ from risk import KillSwitch
 from strategy import _rsi, decide
 
 log = get_logger("bot")
+
+# Per-symbol max-seen ROE since the current position opened. Reset to None when
+# the position goes flat. In-memory only — bot restart resets the high-water
+# mark, which means a position already past +30% would re-arm from current ROE.
+_position_max_roe: dict[str, float] = {}
 
 
 def load_env() -> tuple[str, str]:
@@ -162,27 +171,94 @@ def maybe_run_ai(last_ai_run: float, client: HyperliquidClient, kill: KillSwitch
     return now
 
 
+def _compute_roe_pct(pos: dict) -> Optional[float]:
+    """ROE% = unrealizedPnl / marginUsed × 100, using Hyperliquid's own fields."""
+    try:
+        pnl = float(pos.get("unrealizedPnl", 0))
+        margin = float(pos.get("marginUsed", 0))
+        if margin > 0:
+            return pnl / margin * 100.0
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _check_trailing_stop(symbol: str, roe: float) -> Optional[tuple[float, float]]:
+    """Update max-seen ROE and check whether trailing-stop should fire.
+
+    Returns (max_roe_seen, armed_floor) if the stop has tripped, else None.
+    """
+    prev_max = _position_max_roe.get(symbol)
+    new_max = roe if prev_max is None else max(prev_max, roe)
+    _position_max_roe[symbol] = new_max
+
+    armed_floor: Optional[float] = None
+    for tier_arm, tier_floor in config.TRAILING_TIERS:
+        if new_max >= tier_arm:
+            armed_floor = tier_floor
+
+    if armed_floor is None:
+        return None
+    if roe <= armed_floor:
+        return new_max, armed_floor
+    return None
+
+
 def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
                     current_settings: dict[str, Any], ai_meta: dict[str, Any]) -> None:
-    """Single-symbol slice of a tick: fetch closes -> decide -> gate -> execute."""
+    """One symbol per tick: trailing-stop check -> compute signal -> gate -> execute."""
+    # 1. Trailing stop check — runs every tick regardless of signal.
+    try:
+        pos = client.get_open_position(symbol)
+    except Exception as e:
+        log.error(f"[{symbol}] position fetch failed: {e}")
+        pos = None
+
+    if pos is None:
+        _position_max_roe.pop(symbol, None)
+    else:
+        roe = _compute_roe_pct(pos)
+        if roe is not None:
+            triggered = _check_trailing_stop(symbol, roe)
+            if triggered:
+                max_seen, floor = triggered
+                log.warning(
+                    f"[{symbol}] [Trailing Stop Triggered] max ROE {max_seen:+.2f}% -> "
+                    f"floor {floor:+.2f}%, current {roe:+.2f}%; closing position."
+                )
+                try:
+                    client.market_close(symbol)
+                except Exception as e:
+                    log.error(f"[{symbol}] trailing-stop close failed: {e}")
+                _position_max_roe.pop(symbol, None)
+                return
+            else:
+                log.info(f"[{symbol}] ROE {roe:+.2f}% (max {_position_max_roe.get(symbol, roe):+.2f}%)")
+
+    # 2. Fetch candles + compute signal.
     try:
         closes = client.get_recent_closes(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK)
     except Exception as e:
         log.error(f"[{symbol}] candle fetch failed: {e}")
         return
 
-    if len(closes) < config.RSI_PERIOD + 1:
+    if len(closes) < max(config.RSI_PERIOD + 1, config.EMA_SLOW_PERIOD * 3, config.BB_PERIOD):
         log.warning(f"[{symbol}] not enough candles ({len(closes)}); skipping.")
         return
 
     signal, info = decide(closes, current_settings)
-    rsi = info["rsi"]
 
     if signal == "HOLD":
-        log.info(f"[{symbol}] HOLD (RSI={rsi})")
+        log.info(
+            f"[{symbol}] HOLD | RSI={info['rsi']} EMA{config.EMA_FAST_PERIOD}/{config.EMA_SLOW_PERIOD}={info['ema_trend']} "
+            f"BB={info['bb_position']}"
+        )
         return
 
-    log.info(f"[{symbol}] Signal: {signal} | RSI={rsi} thresholds={info['thresholds']}")
+    log.info(
+        f"[{symbol}] Signal: {signal} via {info.get('trigger', '?')} | "
+        f"RSI={info['rsi']} EMA={info['ema_trend']} BB={info['bb_position']}"
+    )
 
     multiplier = float(current_settings.get("TRADE_SIZE_MULTIPLIER", 1.0))
     base_size = float(config.BASE_TRADE_SIZE_USD.get(symbol, 0.0))
@@ -205,6 +281,13 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
             "last_reason": ai_meta.get("last_reason"),
             "btc_dominance": ai_meta.get("btc_dominance"),
             "funding_rate": funding_rates.get(symbol),
+            "ema_trend": info["ema_trend"],
+            "ema_fast": info["ema_fast"],
+            "ema_slow": info["ema_slow"],
+            "bb_upper": info["bb_upper"],
+            "bb_lower": info["bb_lower"],
+            "bb_position": info["bb_position"],
+            "signal_trigger": info.get("trigger"),
         })
         allow, source, reason = trade_gate.judge_trade(signal, gate_ctx)
         if not allow:

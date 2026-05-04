@@ -46,24 +46,25 @@ limits.
 │   bot.tick():                                                    │
 │     check kill switch                                            │
 │     for symbol in [SOL, ETH, ADA]:                               │
-│       fetch 1m closes → compute RSI(14)                          │
-│       if RSI < 25 → BUY signal                                   │
-│       if RSI > 75 → SELL signal                                  │
-│       if BUY/SELL:                                               │
-│         ┌────── Trade Gate (dual AI consensus) ──────┐          │
-│         │  Gemini  ─┐                                │          │
-│         │  MiniMax ─┤  both must say GO              │          │
-│         │           ▼                                │          │
-│         │       allow / skip                         │          │
-│         └────────────────────────────────────────────┘          │
-│       if allow → market_open(symbol, side, BASE × MULTIPLIER)   │
+│       1) trailing-stop check on existing position                │
+│            track max ROE since entry                             │
+│            ROE >= +15% → arm breakeven floor (0%)                │
+│            ROE >= +30% → arm +15% floor                          │
+│            ROE drops to armed floor → market_close + log         │
+│       2) fetch 1m closes → compute RSI(14) + EMA(9,21) + BB(20,2)│
+│       3) composite signal (locked):                              │
+│            BUY  if EMA9>EMA21 AND (RSI<25 OR close<BB_lower)     │
+│            SELL if EMA9<EMA21 AND (RSI>75 OR close>BB_upper)     │
+│       4) if BUY/SELL → Trade Gate (Gemini ‖ MiniMax)             │
+│            both GO → execute                                     │
+│       5) if allow → market_open(symbol, side, BASE × MULTIPLIER) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 | File | Role |
 |---|---|
 | `bot.py` | Main 60-second tick loop, multi-symbol orchestration |
-| `strategy.py` | RSI(14) signal — locked thresholds 25/75 |
+| `strategy.py` | Composite signal — EMA(9/21) trend filter + (RSI 25/75 OR Bollinger 20/2σ breakout) |
 | `exchange.py` | Hyperliquid SDK wrapper |
 | `risk.py` | Account-level drawdown kill switch |
 | `ai_analyst.py` | 3-round AI pipeline (Gemini + MiniMax + supplementary data) |
@@ -139,8 +140,13 @@ python compare_ai.py 5    # 5 runs each, prints mean/stdev/latency
 | `LOOP_SECONDS` | `60` | Bot tick interval |
 | `CANDLE_INTERVAL` | `"1m"` | Candle resolution feeding RSI |
 | `RSI_PERIOD` | `14` | Wilder RSI lookback |
-| `RSI_OVERSOLD` | `25.0` | **Locked** — RSI below this → BUY signal |
-| `RSI_OVERBOUGHT` | `75.0` | **Locked** — RSI above this → SELL signal |
+| `RSI_OVERSOLD` | `25.0` | **Locked** — one of the BUY trigger conditions |
+| `RSI_OVERBOUGHT` | `75.0` | **Locked** — one of the SELL trigger conditions |
+| `EMA_FAST_PERIOD` | `9` | EMA fast period for trend filter |
+| `EMA_SLOW_PERIOD` | `21` | EMA slow period (BULL when fast > slow) |
+| `BB_PERIOD` | `20` | Bollinger Bands lookback |
+| `BB_STDEV` | `2.0` | Bollinger Bands stdev multiplier |
+| `TRAILING_TIERS` | `[(15,0),(30,15)]` | List of `(arm ROE%, floor ROE%)`. ROE crossing arm raises the floor; ROE dropping back to floor closes the position |
 | `USE_TESTNET` | `False` | Switch to Hyperliquid testnet |
 | `DEMO_FAKE_LOSS` | `False` | Force kill switch on second tick (testing only) |
 | `AI_REFRESH_SECONDS` | `900` | How often `ai_analyst.run_once()` runs (15 min) |
@@ -228,18 +234,58 @@ otherwise (neutral)           → mult=1.0,  loss=2%
 
 Final per-symbol order USD = `BASE_TRADE_SIZE_USD[symbol] × TRADE_SIZE_MULTIPLIER`.
 
-> **RSI thresholds are locked at 25 / 75 in `config.py`** and intentionally not
+> **All entry thresholds are locked in `config.py`** and intentionally not
 > AI-tunable. The AI controls *how big* and *how risky* — not *when* to enter.
 
-### B. Trade gate (every signal) — `trade_gate.judge_trade()`
+### B. Composite signal (every tick) — `strategy.decide()`
 
-Whenever any symbol's 1m RSI crosses 25 or 75, that **specific symbol's**
+Pure-Python implementations of EMA, RSI, and Bollinger Bands (no `pandas-ta`
+dependency).
+
+```
+For each symbol on every 60s tick:
+  ema_fast = EMA(closes, 9)
+  ema_slow = EMA(closes, 21)
+  rsi      = RSI(closes, 14)
+  upper, mid, lower = Bollinger(closes, 20, 2σ)
+  ema_trend = "BULL" if ema_fast > ema_slow else "BEAR"
+
+  BUY  if ema_trend == "BULL" and (rsi < 25  or  close < lower)
+  SELL if ema_trend == "BEAR" and (rsi > 75  or  close > upper)
+  else HOLD
+```
+
+The EMA acts as a **regime filter**: even an extreme RSI or a Bollinger
+breakout will be ignored if the short-term trend disagrees. This makes the
+strategy stricter than pure RSI — it deliberately misses some early reversals
+to avoid catching falling knives in a sustained downtrend (and vice-versa for
+shorts in a rally).
+
+### C. Trailing stop (every tick) — runs before signal evaluation
+
+Per symbol, the bot tracks `unrealizedPnl / marginUsed × 100` (Hyperliquid's
+own fields, so leverage is reflected) and the **max ROE seen since position
+opened**. `config.TRAILING_TIERS = [(15, 0), (30, 15)]` arms tiered floors:
+
+| Max ROE seen | Armed floor | Behaviour |
+|---|---|---|
+| ≥ +15% | breakeven (0%) | Position closes if ROE drops to 0% |
+| ≥ +30% | +15% lock-in | Position closes if ROE drops to +15% |
+
+When a floor is breached, the bot logs `[Trailing Stop Triggered]` and issues
+`market_close`. State (`_position_max_roe`) is in-memory and resets on bot
+restart — a position already past +30% before restart will re-arm from
+whatever ROE it shows on the first tick after restart.
+
+### D. Trade gate (every entry signal) — `trade_gate.judge_trade()`
+
+Whenever the composite signal returns BUY or SELL, that **specific symbol's**
 context is sent to a dual-AI gate:
 
 ```
 context to gate:
-  signal (BUY/SELL)
-  symbol-specific: price, 24h change, RSI, position, funding rate
+  signal (BUY/SELL) + which sub-trigger fired (RSI extreme / BB break)
+  symbol-specific: price, 24h change, RSI, EMA trend, BB position, position, funding rate
   account-wide:   session PnL, latest sentiment, BTC dominance
   recent headlines (top 5)
 
@@ -310,9 +356,13 @@ The only function you need to change to swap strategies is
 `strategy.decide(closes, settings) -> (Signal, info_dict)`. Keep the
 signature, return one of `"BUY"` / `"SELL"` / `"HOLD"`.
 
-The current implementation is locked-threshold RSI(14) at 25/75; consider this
-a thin reference, not a recommendation. The AI layer is independent of the
-strategy and will keep working with any signal source.
+The current implementation is a composite EMA(9/21) trend filter combined with
+RSI(14) extremes 25/75 OR Bollinger(20, 2σ) breakouts. The AI layer and the
+trailing-stop logic are independent of the signal function — any replacement
+that returns the same `(Signal, info_dict)` shape will keep them working,
+though the trade gate prompt expects `info["ema_trend"]`, `info["bb_position"]`,
+and `info["trigger"]` fields if you want the gate's regime reasoning to remain
+informed.
 
 ---
 

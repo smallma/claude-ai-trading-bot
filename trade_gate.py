@@ -37,18 +37,33 @@ def _build_prompt(signal: str, ctx: dict[str, Any]) -> str:
     funding = ctx.get("funding_rate")
     funding_str = f"{funding * 100:.4f}% / 8h" if funding is not None else "n/a"
 
+    ema_trend = ctx.get("ema_trend", "n/a")
+    ema_fast = ctx.get("ema_fast")
+    ema_slow = ctx.get("ema_slow")
+    ema_str = (f"{ema_trend} (EMA{config.EMA_FAST_PERIOD}={ema_fast:.4f} vs "
+               f"EMA{config.EMA_SLOW_PERIOD}={ema_slow:.4f})"
+               if ema_fast is not None and ema_slow is not None else ema_trend)
+    bb_upper = ctx.get("bb_upper")
+    bb_lower = ctx.get("bb_lower")
+    bb_pos = ctx.get("bb_position", "n/a")
+    bb_str = (f"{bb_pos} (lower={bb_lower:.4f} upper={bb_upper:.4f})"
+              if bb_upper is not None and bb_lower is not None else bb_pos)
+    trigger = ctx.get("signal_trigger", "n/a")
+
     headlines = ctx.get("recent_headlines") or []
     headlines_block = "\n".join(f"- {h}" for h in headlines[:5]) or "(none)"
 
     return f"""You are a final trade-confirmation gate for an automated multi-coin perp bot.
-A {signal} signal just fired for {ctx.get('symbol', '?')} (its 1m RSI hit the
-LOCKED extreme of {config.RSI_OVERSOLD if signal == 'BUY' else config.RSI_OVERBOUGHT}).
+A {signal} signal just fired for {ctx.get('symbol', '?')} via "{trigger}" under
+the composite rule: EMA trend filter + (RSI extreme OR Bollinger breakout).
 Your one binary call: execute right now, or skip and let the next minute decide?
 
-=== Current state for this symbol ===
-- Signal: {signal} {ctx.get('symbol', '?')}
+=== Technical state for this symbol ===
+- Signal: {signal} {ctx.get('symbol', '?')}  (trigger: {trigger})
 - Price: ${ctx.get('price', 0):.4f} (24h {change_str})
 - RSI(14): {rsi_str}
+- EMA trend: {ema_str}
+- Bollinger Bands ({config.BB_PERIOD}, {config.BB_STDEV}σ): price is {bb_str}
 - Position: {ctx.get('position', 'FLAT')}
 - Funding rate: {funding_str}
 
@@ -65,6 +80,10 @@ Your one binary call: execute right now, or skip and let the next minute decide?
 - SKIP if BTC dominance is rising hard AND signal is BUY for an alt (SOL/ADA).
 - SKIP if funding rate is extreme (>0.05% per 8h) and signal is BUY (crowded long).
 - SKIP if session PnL is already < -1.5% (avoid revenge trades).
+- Treat the EMA trend as the primary regime filter — strong agreement between
+  EMA trend and signal direction is a green light; mismatch is a yellow flag.
+- A "BB lower break" BUY in a still-falling market can be a knife-catch — be
+  cautious if BTC dominance is rising or sentiment is weak.
 - Otherwise GO.
 
 === Output (strictly two lines) ===
