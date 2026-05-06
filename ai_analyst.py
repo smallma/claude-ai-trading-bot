@@ -448,7 +448,26 @@ def run_once(market_ctx: Optional[dict] = None, client=None) -> Optional[int]:
     )
 
     current = settings.load()
-    current.update(params)
+    auto_capital = bool(current.get("AUTO_CAPITAL_TUNE", False))
+    applied = auto_capital
+    if applied:
+        current.update(params)
+    else:
+        log.info(
+            f"AUTO_CAPITAL_TUNE=False — keeping live mult={current.get('TRADE_SIZE_MULTIPLIER')} "
+            f"loss={current.get('DAILY_LOSS_LIMIT')}; storing suggestion only."
+        )
+
+    suggestion = {
+        "TRADE_SIZE_MULTIPLIER": params["TRADE_SIZE_MULTIPLIER"],
+        "DAILY_LOSS_LIMIT": params["DAILY_LOSS_LIMIT"],
+        "score": final["score"],
+        "confidence": final["confidence"],
+        "reason": final["reason"],
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+        "applied": applied,
+    }
+
     current["ai_meta"] = {
         "last_sentiment": final["score"],
         "last_confidence": final["confidence"],
@@ -461,6 +480,7 @@ def run_once(market_ctx: Optional[dict] = None, client=None) -> Optional[int]:
         "round1": {name: {"score": r["score"], "confidence": r["confidence"]} for name, r in round1},
         "judge_shots": final.get("judge_shots"),
         "judge_score_stdev": final.get("judge_score_stdev"),
+        "suggested_capital": suggestion,
     }
     settings.save(current)
     return final["score"]

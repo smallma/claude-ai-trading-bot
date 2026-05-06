@@ -15,6 +15,11 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 DEFAULTS: dict[str, Any] = {
     "TRADE_SIZE_MULTIPLIER": 1.0,
     "DAILY_LOSS_LIMIT": 0.02,
+    # Approval gates — when False, AI/reviewer write SUGGESTIONS into ai_meta
+    # and wait for the dashboard operator to apply them. When True, changes
+    # take effect automatically.
+    "AUTO_CAPITAL_TUNE": False,
+    "AUTO_STRATEGY_EVOLVE": False,
     "ai_meta": {
         "last_sentiment": None,
         "last_updated": None,

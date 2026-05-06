@@ -183,8 +183,13 @@ def _decide_quorum(votes: dict[str, tuple[str, str]]) -> tuple[bool, str]:
                     else "consensus broken (need both GO)")
 
 
-def judge_trade(signal: str, ctx: dict[str, Any]) -> tuple[bool, str, str]:
-    """Returns (allow, source_label, combined_reason)."""
+def judge_trade(signal: str, ctx: dict[str, Any]) -> tuple[bool, str, str, dict[str, dict]]:
+    """Returns (allow, source_label, combined_reason, votes_struct).
+
+    votes_struct: {analyst_name: {"decision": "GO"|"SKIP", "reason": str}} —
+    the journal stores this verbatim so we can later attribute trades to
+    specific analyst decisions.
+    """
     prompt = _build_prompt(signal, ctx)
     symbol = ctx.get("symbol", "?")
 
@@ -203,6 +208,7 @@ def judge_trade(signal: str, ctx: dict[str, Any]) -> tuple[bool, str, str]:
     src = "+".join(votes.keys()) or "none"
     per_vote = " | ".join(f"{n}={d}: {r}" for n, (d, r) in votes.items()) or "(no responses)"
     final_reason = f"{rationale} || {per_vote}"
+    votes_struct = {n: {"decision": d, "reason": r} for n, (d, r) in votes.items()}
 
     log.info(f"[{symbol}] Trade gate [{src}] -> {'GO' if allow else 'SKIP'} on {signal} | {rationale}")
-    return allow, src, final_reason
+    return allow, src, final_reason, votes_struct
