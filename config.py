@@ -63,5 +63,5 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 # Round 3 judge: how many times to call MiniMax and take the median score.
 JUDGE_MULTI_SHOT = 3
 
-# Trade gate: AI confirmation before placing orders. False = pure RSI; True = must pass AI gate.
-TRADE_GATE_ENABLED = True
+# Trade gate (AI confirmation before placing orders) is now dynamic — see
+# settings.DEFAULTS["TRADE_GATE_ENABLED"] / config.json. Toggle from dashboard.

@@ -316,6 +316,7 @@ def _build_decision_context(
     info: dict[str, Any],
     gate_ctx: dict[str, Any],
     gate_votes: dict[str, dict],
+    gate_enabled: bool,
     current_settings: dict[str, Any],
     ai_meta: dict[str, Any],
 ) -> dict[str, Any]:
@@ -335,7 +336,7 @@ def _build_decision_context(
             "bb_position": info.get("bb_position"),
         },
         "ai_gate": {
-            "enabled": config.TRADE_GATE_ENABLED,
+            "enabled": gate_enabled,
             "votes": gate_votes,
         },
         "sentiment": {
@@ -475,7 +476,8 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
     })
 
     gate_votes: dict[str, dict] = {}
-    if config.TRADE_GATE_ENABLED:
+    gate_enabled = bool(current_settings.get("TRADE_GATE_ENABLED", True))
+    if gate_enabled:
         allow, source, reason, gate_votes = trade_gate.judge_trade(signal, gate_ctx)
         if not allow:
             log.info(f"[{symbol}] Trade gate SKIP via {source}: {reason}")
@@ -487,6 +489,7 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
         info=info,
         gate_ctx=gate_ctx,
         gate_votes=gate_votes,
+        gate_enabled=gate_enabled,
         current_settings=current_settings,
         ai_meta=ai_meta,
     )

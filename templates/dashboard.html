@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>Trading Bot Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #0e1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --amber: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, "Segoe UI", sans-serif; margin: 0;
+         background: var(--bg); color: var(--fg); font-size: 14px; }
+  header { padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header .grow { flex: 1; }
+  main { padding: 16px; display: grid; gap: 16px;
+         grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+           padding: 14px 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--muted);
+              text-transform: uppercase; letter-spacing: 0.04em; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px;
+        font-variant-numeric: tabular-nums; }
+  .kv dt { color: var(--muted); }
+  .pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.long { background: rgba(63,185,80,0.15); color: var(--green); }
+  .pill.short { background: rgba(248,81,73,0.15); color: var(--red); }
+  .pill.flat { background: rgba(139,148,158,0.15); color: var(--muted); }
+  .pill.go { background: rgba(63,185,80,0.15); color: var(--green); }
+  .pill.skip { background: rgba(248,81,73,0.15); color: var(--red); }
+  .pos-grid { display: grid; gap: 8px;
+              grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  .pos { border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
+  .pos.flat { opacity: 0.55; }
+  .pos .roe.pos { color: var(--green); }
+  .pos .roe.neg { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase;
+       letter-spacing: 0.04em; }
+  tr.tr-clickable { cursor: pointer; }
+  tr.tr-clickable:hover { background: rgba(255,255,255,0.03); }
+  tr.detail { background: #0a0d12; }
+  tr.detail td { padding: 12px; font-family: ui-monospace, monospace; font-size: 12px;
+                 white-space: pre-wrap; word-break: break-word; }
+  button { background: var(--accent); color: #0d1117; border: 0; padding: 6px 12px;
+           border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.secondary { background: var(--panel); color: var(--fg); border: 1px solid var(--border); }
+  button.warn { background: var(--amber); color: #0d1117; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  input[type=number], input[type=text] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font-size: 13px; width: 110px; font-variant-numeric: tabular-nums; }
+  label.toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .danger { color: var(--red); }
+  .ok { color: var(--green); }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .toast { position: fixed; bottom: 16px; right: 16px; padding: 10px 14px; border-radius: 6px;
+           background: var(--panel); border: 1px solid var(--border);
+           box-shadow: 0 4px 12px rgba(0,0,0,0.4); display: none; }
+  .toast.show { display: block; }
+  .sugg-box { border: 1px dashed var(--amber); padding: 10px; border-radius: 6px;
+              background: rgba(210,153,34,0.05); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Trading Bot Dashboard</h1>
+  <span class="meta" id="last-refresh">—</span>
+  <span class="meta" id="env-badge"></span>
+  <div class="grow"></div>
+  <button class="secondary" onclick="refresh()">Refresh</button>
+  <button class="secondary" onclick="window.location='/api/download'">Download Journal</button>
+</header>
+<main>
+  <section class="panel">
+    <h2>Open Positions</h2>
+    <div id="positions" class="pos-grid"></div>
+    <div class="row small muted" style="margin-top:10px">
+      <span>Equity:</span><span id="equity">—</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Dynamic Config</h2>
+    <div class="kv" id="cfg-static"></div>
+    <hr style="border:0; border-top:1px solid var(--border); margin:12px 0">
+    <h2 style="margin-top:0">Editable</h2>
+    <div id="cfg-editor"></div>
+    <div class="row" style="margin-top:10px">
+      <button onclick="saveConfig()">Save Config</button>
+      <span class="muted small" id="cfg-status"></span>
+    </div>
+    <hr style="border:0; border-top:1px solid var(--border); margin:14px 0">
+    <h2 style="margin-top:0">AI Capital Suggestion</h2>
+    <div id="suggestion"></div>
+  </section>
+
+  <section class="panel" style="grid-column: 1 / -1">
+    <h2>Recent Trades (latest 50)</h2>
+    <table id="trades">
+      <thead><tr>
+        <th>Time (UTC)</th><th>Type</th><th>Symbol</th><th>Side</th>
+        <th>Price</th><th>Size USD</th><th>Reason / Trigger</th><th>ROE / PnL</th>
+      </tr></thead>
+      <tbody id="trades-body"></tbody>
+    </table>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let LAST_STATE = null;
+
+function fmt(n, digits=2) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return Number(n).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
+}
+function fmtTs(iso) {
+  if (!iso) return "—";
+  return iso.replace("T", " ").replace(/\.\d+/, "").replace("+00:00", "Z").replace("Z", "");
+}
+function toast(msg, kind="ok") {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show";
+  t.style.borderColor = (kind === "err") ? "var(--red)" : "var(--green)";
+  setTimeout(() => t.className = "toast", 2500);
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state");
+    const s = await r.json();
+    LAST_STATE = s;
+    renderPositions(s);
+    renderConfig(s);
+    renderSuggestion(s);
+    renderTrades(s.trades || []);
+    $("last-refresh").textContent = "refreshed " + fmtTs(s.now);
+    $("env-badge").textContent = s.static.USE_TESTNET ? "TESTNET" : "MAINNET";
+    $("env-badge").style.color = s.static.USE_TESTNET ? "var(--amber)" : "var(--red)";
+    $("equity").textContent = s.equity != null ? "$" + fmt(s.equity, 2) : "—";
+  } catch (e) {
+    toast("refresh failed: " + e, "err");
+  }
+}
+
+function renderPositions(s) {
+  const grid = $("positions");
+  grid.innerHTML = "";
+  for (const p of s.positions) {
+    const div = document.createElement("div");
+    const isFlat = p.side === "FLAT" || p.side === "UNKNOWN" || p.side === "ERROR";
+    div.className = "pos" + (isFlat ? " flat" : "");
+    let pillCls = "flat";
+    if (p.side === "LONG") pillCls = "long";
+    else if (p.side === "SHORT") pillCls = "short";
+    let body = `<div class="row" style="justify-content:space-between">
+      <strong>${p.symbol}</strong><span class="pill ${pillCls}">${p.side}</span></div>`;
+    if (!isFlat) {
+      const roeCls = p.roe_pct == null ? "" : (p.roe_pct >= 0 ? "pos" : "neg");
+      body += `<div class="kv small" style="margin-top:8px">
+        <dt>Size</dt><dd>${fmt(p.size, 4)}</dd>
+        <dt>Entry</dt><dd>$${fmt(p.entry_price, 4)}</dd>
+        <dt>PnL</dt><dd>$${fmt(p.unrealized_pnl, 4)}</dd>
+        <dt>Margin</dt><dd>$${fmt(p.margin_used, 2)}</dd>
+        <dt>ROE</dt><dd class="roe ${roeCls}">${p.roe_pct != null ? fmt(p.roe_pct,2)+'%' : '—'}</dd>
+      </div>`;
+    } else if (p.error) {
+      body += `<div class="small danger">${p.error}</div>`;
+    }
+    div.innerHTML = body;
+    grid.appendChild(div);
+  }
+}
+
+function renderConfig(s) {
+  const cfg = s.config || {};
+  const stat = s.static || {};
+  $("cfg-static").innerHTML = `
+    <dt>Symbols</dt><dd>${(stat.SYMBOLS || []).join(", ")}</dd>
+    <dt>Base USD</dt><dd>${Object.entries(stat.BASE_TRADE_SIZE_USD || {}).map(([k,v])=>`${k}=$${v}`).join(" / ")}</dd>
+    <dt>RSI thresholds</dt><dd>${stat.RSI_OVERSOLD} / ${stat.RSI_OVERBOUGHT} (locked)</dd>
+    <dt>AI refresh</dt><dd>${stat.AI_REFRESH_SECONDS}s</dd>
+  `;
+  const ed = $("cfg-editor");
+  ed.innerHTML = `
+    <div class="row">
+      <label>TRADE_SIZE_MULTIPLIER
+        <input type="number" id="ed-mult" step="0.05" min="0" value="${cfg.TRADE_SIZE_MULTIPLIER ?? 1.0}">
+      </label>
+      <label>DAILY_LOSS_LIMIT
+        <input type="number" id="ed-loss" step="0.005" min="0" max="1" value="${cfg.DAILY_LOSS_LIMIT ?? 0.02}">
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label class="toggle">
+        <input type="checkbox" id="ed-gate" ${cfg.TRADE_GATE_ENABLED ? "checked" : ""}>
+        TRADE_GATE_ENABLED
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="ed-cap" ${cfg.AUTO_CAPITAL_TUNE ? "checked" : ""}>
+        AUTO_CAPITAL_TUNE
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="ed-evo" ${cfg.AUTO_STRATEGY_EVOLVE ? "checked" : ""}>
+        AUTO_STRATEGY_EVOLVE
+      </label>
+    </div>
+  `;
+}
+
+async function saveConfig() {
+  const body = {
+    TRADE_SIZE_MULTIPLIER: parseFloat($("ed-mult").value),
+    DAILY_LOSS_LIMIT: parseFloat($("ed-loss").value),
+    TRADE_GATE_ENABLED: $("ed-gate").checked,
+    AUTO_CAPITAL_TUNE: $("ed-cap").checked,
+    AUTO_STRATEGY_EVOLVE: $("ed-evo").checked,
+  };
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "save failed");
+    const n = Object.keys(j.changed || {}).length;
+    toast(n ? `Saved ${n} field(s)` : "No changes", n ? "ok" : "err");
+    refresh();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+function renderSuggestion(s) {
+  const meta = (s.config && s.config.ai_meta) || {};
+  const sugg = meta.suggested_capital;
+  const div = $("suggestion");
+  if (!sugg) {
+    div.innerHTML = `<span class="muted small">No AI suggestion yet — waiting for next AI cycle.</span>`;
+    return;
+  }
+  const live = s.config || {};
+  const same = (Number(sugg.TRADE_SIZE_MULTIPLIER) === Number(live.TRADE_SIZE_MULTIPLIER) &&
+                Number(sugg.DAILY_LOSS_LIMIT) === Number(live.DAILY_LOSS_LIMIT));
+  const status = sugg.applied ? `<span class="ok small">APPLIED</span>` :
+                 same ? `<span class="muted small">matches live config</span>` :
+                        `<span class="pill skip">PENDING</span>`;
+  div.innerHTML = `
+    <div class="sugg-box">
+      <div class="row" style="justify-content:space-between">
+        <strong>Score ${sugg.score ?? "?"}/10 (conf ${fmt(sugg.confidence ?? 0,2)})</strong>
+        ${status}
+      </div>
+      <div class="kv small" style="margin-top:6px">
+        <dt>Suggested mult</dt><dd>${sugg.TRADE_SIZE_MULTIPLIER} (live: ${live.TRADE_SIZE_MULTIPLIER})</dd>
+        <dt>Suggested loss limit</dt><dd>${(sugg.DAILY_LOSS_LIMIT*100).toFixed(2)}% (live: ${(live.DAILY_LOSS_LIMIT*100).toFixed(2)}%)</dd>
+        <dt>Reason</dt><dd>${escapeHtml(sugg.reason || "")}</dd>
+        <dt>Computed</dt><dd>${fmtTs(sugg.computed_at)}</dd>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="warn" onclick="applySuggestion()" ${sugg.applied || same ? "disabled" : ""}>Apply Suggestion</button>
+      </div>
+    </div>`;
+}
+
+async function applySuggestion() {
+  if (!confirm("Apply AI's suggested capital settings to live config?")) return;
+  try {
+    const r = await fetch("/api/apply-suggestion", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "apply failed");
+    toast(`Applied: mult=${j.applied.TRADE_SIZE_MULTIPLIER} loss=${j.applied.DAILY_LOSS_LIMIT}`);
+    refresh();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+function renderTrades(trades) {
+  const tbody = $("trades-body");
+  tbody.innerHTML = "";
+  if (!trades.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">No trades recorded yet.</td></tr>`;
+    return;
+  }
+  for (const t of trades) {
+    const tr = document.createElement("tr");
+    tr.className = "tr-clickable";
+    const isEntry = t.type === "ENTRY";
+    const reason = isEntry
+      ? (t.decision_context?.trigger || "—")
+      : (t.exit_context?.exit_reason || "—");
+    let roeCell = "—";
+    if (!isEntry && t.exit_context) {
+      const fr = t.exit_context.final_roe_pct;
+      const pnl = t.exit_context.pnl_usd;
+      roeCell = (fr != null ? fmt(fr,2)+"%" : "—") + (pnl != null ? ` / $${fmt(pnl,2)}` : "");
+    }
+    tr.innerHTML = `
+      <td>${fmtTs(t.ts)}</td>
+      <td><span class="pill ${isEntry?'long':'skip'}">${t.type}</span></td>
+      <td>${t.symbol || ""}</td>
+      <td>${t.side || ""}</td>
+      <td>$${fmt(t.fill_price, 4)}</td>
+      <td>$${fmt(t.size_usd, 2)}</td>
+      <td class="small">${escapeHtml(reason)}</td>
+      <td>${roeCell}</td>
+    `;
+    tr.addEventListener("click", () => toggleDetail(tr, t));
+    tbody.appendChild(tr);
+  }
+}
+
+function toggleDetail(tr, rec) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("detail")) {
+    next.remove();
+    return;
+  }
+  const detailRow = document.createElement("tr");
+  detailRow.className = "detail";
+  const td = document.createElement("td");
+  td.colSpan = 8;
+  const ctx = rec.type === "ENTRY" ? rec.decision_context : rec.exit_context;
+  td.textContent = JSON.stringify({
+    trade_id: rec.trade_id,
+    ts: rec.ts,
+    fill_price: rec.fill_price,
+    size_usd: rec.size_usd,
+    size_units: rec.size_units,
+    [rec.type === "ENTRY" ? "decision_context" : "exit_context"]: ctx,
+  }, null, 2);
+  detailRow.appendChild(td);
+  tr.after(detailRow);
+}
+
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

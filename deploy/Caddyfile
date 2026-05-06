@@ -1,0 +1,36 @@
+# Caddyfile — public HTTPS reverse proxy for the dashboard.
+#
+# Replace bot.yourdomain.com with the hostname pointing at this VM.
+# Replace YOUR_BCRYPT_HASH with the output of:
+#     caddy hash-password
+# (paste your chosen password; copy the printed $2a$... hash here.)
+#
+# Caddy auto-provisions a Let's Encrypt cert for the hostname on first hit.
+
+bot.yourdomain.com {
+    encode zstd gzip
+
+    # Deny common scanners cheaply.
+    @forbidden {
+        path /.env /.git/* /wp-* /admin /phpmyadmin*
+    }
+    respond @forbidden 404
+
+    basicauth {
+        rain YOUR_BCRYPT_HASH
+    }
+
+    reverse_proxy 127.0.0.1:8080 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    log {
+        output file /var/log/caddy/bot-access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format json
+    }
+}

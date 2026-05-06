@@ -1,0 +1,25 @@
+[Unit]
+Description=Trading Bot Dashboard (Flask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Adjust User and paths to match your VM. The bot itself should run under
+# the same user so both processes can read/write config.json.
+User=rain
+WorkingDirectory=/home/rain/claude-ai-trading-bot
+EnvironmentFile=/home/rain/claude-ai-trading-bot/.env
+ExecStart=/home/rain/claude-ai-trading-bot/.venv/bin/python dashboard.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — dashboard only needs to read/write inside its working dir.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/rain/claude-ai-trading-bot
+
+[Install]
+WantedBy=multi-user.target

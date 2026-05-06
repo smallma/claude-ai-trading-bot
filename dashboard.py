@@ -1,0 +1,244 @@
+"""Flask dashboard for the trading bot.
+
+Endpoints
+  GET  /                      Single-page UI
+  GET  /api/state             positions, equity, config, latest trades
+  GET  /api/trade/<trade_id>  full ENTRY+EXIT pair for one trade_id
+  POST /api/config            update whitelisted dynamic settings
+  POST /api/apply-suggestion  apply ai_meta.suggested_capital -> live config
+  GET  /api/download          one-click zip of all retained journal files
+
+Bind: 127.0.0.1:8080. Public exposure happens via Caddy (HTTPS + Basic Auth)
+in deploy/Caddyfile, never directly. NEVER bind 0.0.0.0 here.
+"""
+import io
+import os
+import zipfile
+from datetime import datetime, timezone
+from threading import Lock
+from typing import Any, Optional
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request, send_file
+
+import config
+import journal
+import settings
+from exchange import HyperliquidClient
+from logger import get_logger
+
+load_dotenv()
+
+log = get_logger("dashboard")
+app = Flask(__name__)
+_save_lock = Lock()
+_client: Optional[HyperliquidClient] = None
+
+# Whitelist of fields the UI is allowed to write into config.json. Anything
+# outside this set is rejected — same shape contract as settings.DEFAULTS.
+EDITABLE_FIELDS: dict[str, type] = {
+    "TRADE_SIZE_MULTIPLIER": float,
+    "DAILY_LOSS_LIMIT": float,
+    "AUTO_CAPITAL_TUNE": bool,
+    "AUTO_STRATEGY_EVOLVE": bool,
+    "TRADE_GATE_ENABLED": bool,
+}
+
+
+def _get_client() -> Optional[HyperliquidClient]:
+    """Lazy singleton — read-only Hyperliquid client for position snapshots.
+    Returns None if creds are missing so the dashboard still renders."""
+    global _client
+    if _client is not None:
+        return _client
+    pk = os.getenv("HYPERLIQUID_PRIVATE_KEY")
+    addr = os.getenv("HYPERLIQUID_ADDRESS")
+    if not pk or not addr:
+        log.warning("HYPERLIQUID creds missing — dashboard runs without live positions")
+        return None
+    try:
+        _client = HyperliquidClient(pk, addr, use_testnet=config.USE_TESTNET)
+    except Exception as e:
+        log.error(f"Could not init Hyperliquid client: {e}")
+        return None
+    return _client
+
+
+def _coerce(field: str, value: Any) -> Any:
+    caster = EDITABLE_FIELDS[field]
+    if caster is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
+    return caster(value)
+
+
+def _gather_positions(client: Optional[HyperliquidClient]) -> list[dict]:
+    out: list[dict] = []
+    if client is None:
+        for sym in config.SYMBOLS:
+            out.append({"symbol": sym, "side": "UNKNOWN", "error": "no client"})
+        return out
+    for sym in config.SYMBOLS:
+        try:
+            pos = client.get_open_position(sym)
+        except Exception as e:
+            out.append({"symbol": sym, "side": "ERROR", "error": str(e)})
+            continue
+        if pos is None:
+            out.append({"symbol": sym, "side": "FLAT"})
+            continue
+        try:
+            szi = float(pos.get("szi", 0))
+            pnl = float(pos.get("unrealizedPnl", 0))
+            margin = float(pos.get("marginUsed", 0))
+        except (TypeError, ValueError):
+            szi, pnl, margin = 0.0, 0.0, 0.0
+        roe = (pnl / margin * 100) if margin > 0 else None
+        out.append({
+            "symbol": sym,
+            "side": "LONG" if szi > 0 else "SHORT" if szi < 0 else "FLAT",
+            "size": abs(szi),
+            "entry_price": float(pos.get("entryPx") or 0) or None,
+            "unrealized_pnl": pnl,
+            "margin_used": margin,
+            "roe_pct": round(roe, 2) if roe is not None else None,
+        })
+    return out
+
+
+@app.route("/")
+def index():
+    return render_template("dashboard.html", symbols=config.SYMBOLS)
+
+
+@app.route("/api/state")
+def api_state():
+    cfg = settings.load()
+    client = _get_client()
+    positions = _gather_positions(client)
+
+    equity: Optional[float] = None
+    if client is not None:
+        try:
+            equity = client.get_account_equity()
+        except Exception as e:
+            log.warning(f"equity fetch failed: {e}")
+
+    # Last 50 trades, newest first. Each record already has trade_id so the UI
+    # can group ENTRY+EXIT pairs.
+    all_records = list(journal.iter_records())
+    recent = all_records[-50:][::-1]
+
+    return jsonify({
+        "config": cfg,
+        "positions": positions,
+        "equity": equity,
+        "trades": recent,
+        "static": {
+            "SYMBOLS": config.SYMBOLS,
+            "BASE_TRADE_SIZE_USD": config.BASE_TRADE_SIZE_USD,
+            "RSI_OVERSOLD": config.RSI_OVERSOLD,
+            "RSI_OVERBOUGHT": config.RSI_OVERBOUGHT,
+            "AI_REFRESH_SECONDS": config.AI_REFRESH_SECONDS,
+            "USE_TESTNET": config.USE_TESTNET,
+        },
+        "now": datetime.now(timezone.utc).isoformat(),
+        "journal_files": [p.name for p in journal.list_files()],
+        "editable_fields": list(EDITABLE_FIELDS.keys()),
+    })
+
+
+@app.route("/api/trade/<trade_id>")
+def api_trade_detail(trade_id: str):
+    """Return the ENTRY + EXIT (if any) records for one trade_id."""
+    matches = [r for r in journal.iter_records() if r.get("trade_id") == trade_id]
+    if not matches:
+        return jsonify({"ok": False, "error": "trade_id not found"}), 404
+    return jsonify({"ok": True, "records": matches})
+
+
+@app.route("/api/config", methods=["POST"])
+def api_set_config():
+    payload = request.get_json(force=True, silent=True) or {}
+    if not isinstance(payload, dict) or not payload:
+        return jsonify({"ok": False, "error": "empty or non-object body"}), 400
+
+    bad = [k for k in payload if k not in EDITABLE_FIELDS]
+    if bad:
+        return jsonify({"ok": False, "error": f"fields not editable: {bad}"}), 400
+
+    changed: dict[str, Any] = {}
+    coerced: dict[str, Any] = {}
+    for k, v in payload.items():
+        try:
+            coerced[k] = _coerce(k, v)
+        except (TypeError, ValueError) as e:
+            return jsonify({"ok": False, "error": f"bad value for {k}: {e}"}), 400
+
+    with _save_lock:
+        cfg = settings.load()
+        for k, v in coerced.items():
+            if cfg.get(k) != v:
+                changed[k] = {"from": cfg.get(k), "to": v}
+                cfg[k] = v
+        settings.save(cfg)
+
+    log.info(f"config update via dashboard: {changed}")
+    return jsonify({"ok": True, "changed": changed})
+
+
+@app.route("/api/apply-suggestion", methods=["POST"])
+def api_apply_suggestion():
+    """Promote ai_meta.suggested_capital -> live TRADE_SIZE_MULTIPLIER / DAILY_LOSS_LIMIT.
+
+    Used when AUTO_CAPITAL_TUNE=False — the AI cycle stages a suggestion, the
+    operator clicks Apply on the dashboard.
+    """
+    with _save_lock:
+        cfg = settings.load()
+        meta = cfg.get("ai_meta") or {}
+        sugg = meta.get("suggested_capital")
+        if not sugg:
+            return jsonify({"ok": False, "error": "no suggestion staged"}), 404
+        try:
+            new_mult = float(sugg["TRADE_SIZE_MULTIPLIER"])
+            new_loss = float(sugg["DAILY_LOSS_LIMIT"])
+        except (KeyError, TypeError, ValueError) as e:
+            return jsonify({"ok": False, "error": f"malformed suggestion: {e}"}), 500
+
+        cfg["TRADE_SIZE_MULTIPLIER"] = new_mult
+        cfg["DAILY_LOSS_LIMIT"] = new_loss
+        sugg["applied"] = True
+        sugg["applied_at"] = datetime.now(timezone.utc).isoformat()
+        meta["suggested_capital"] = sugg
+        cfg["ai_meta"] = meta
+        settings.save(cfg)
+
+    log.info(f"suggestion applied: mult={new_mult} loss={new_loss}")
+    return jsonify({
+        "ok": True,
+        "applied": {"TRADE_SIZE_MULTIPLIER": new_mult, "DAILY_LOSS_LIMIT": new_loss},
+    })
+
+
+@app.route("/api/download")
+def api_download():
+    """Stream all retained journal files as a zip."""
+    files = journal.list_files()
+    if not files:
+        return jsonify({"ok": False, "error": "no journal files yet"}), 404
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in files:
+            zf.write(p, arcname=p.name)
+    buf.seek(0)
+    fname = f"journal-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.zip"
+    return send_file(buf, download_name=fname, mimetype="application/zip", as_attachment=True)
+
+
+if __name__ == "__main__":
+    # Loopback only — Caddy in front handles TLS + Basic Auth.
+    app.run(host="127.0.0.1", port=int(os.getenv("DASHBOARD_PORT", "8080")), debug=False)

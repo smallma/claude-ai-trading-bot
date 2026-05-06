@@ -3,6 +3,7 @@
   "DAILY_LOSS_LIMIT": 0.02,
   "AUTO_CAPITAL_TUNE": false,
   "AUTO_STRATEGY_EVOLVE": false,
+  "TRADE_GATE_ENABLED": true,
   "ai_meta": {
     "last_sentiment": 5,
     "last_confidence": 0.58,

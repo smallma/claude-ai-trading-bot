@@ -20,6 +20,9 @@ DEFAULTS: dict[str, Any] = {
     # take effect automatically.
     "AUTO_CAPITAL_TUNE": False,
     "AUTO_STRATEGY_EVOLVE": False,
+    # AI confirmation gate before placing orders. False = pure RSI/EMA/BB
+    # signals execute directly; True = both Gemini + MiniMax must vote GO.
+    "TRADE_GATE_ENABLED": True,
     "ai_meta": {
         "last_sentiment": None,
         "last_updated": None,
