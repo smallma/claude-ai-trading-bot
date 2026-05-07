@@ -28,6 +28,15 @@ from strategy import _rsi, decide
 
 log = get_logger("bot")
 
+# How often to append a datapoint to journal/equity-YYYYMM.jsonl. The kill
+# switch already pulls equity every tick (60s) so this is just a sampled write,
+# zero new API load. ~12 lines/hour, ~8 MB/year.
+EQUITY_LOG_INTERVAL_SECONDS = 300
+
+# Wall-clock of the last equity-log write. 0.0 forces a write on the first tick
+# so the chart has a starting point immediately after a restart.
+_last_equity_log_ts: float = 0.0
+
 # Per-symbol max-seen ROE since the current position opened. Reset to None when
 # the position goes flat. In-memory only — bot restart resets the high-water
 # mark, which means a position already past +30% would re-arm from current ROE.
@@ -494,10 +503,28 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
     execute_signal(client, symbol, signal, trade_size, decision_context)
 
 
+def _maybe_log_equity(equity: float, kill: KillSwitch) -> None:
+    """Sample equity to journal/equity-*.jsonl every EQUITY_LOG_INTERVAL_SECONDS.
+    Used by the dashboard's equity curve chart."""
+    global _last_equity_log_ts
+    now = time.time()
+    if now - _last_equity_log_ts < EQUITY_LOG_INTERVAL_SECONDS:
+        return
+    _last_equity_log_ts = now
+    session_pnl_pct: Optional[float] = None
+    if kill.anchor_equity:
+        try:
+            session_pnl_pct = (equity - kill.anchor_equity) / kill.anchor_equity * 100.0
+        except ZeroDivisionError:
+            pass
+    journal.log_equity(equity, kill.anchor_equity, session_pnl_pct)
+
+
 def tick(client: HyperliquidClient, kill: KillSwitch, current_settings: dict[str, Any]) -> None:
     real_equity = client.get_account_equity()
     kill.set_anchor(real_equity, current_settings)
     equity = kill.observe(real_equity)
+    _maybe_log_equity(equity, kill)
     if kill.check(equity, current_settings):
         handle_kill_switch(client)
         return

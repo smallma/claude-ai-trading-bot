@@ -27,6 +27,7 @@ RETENTION_MONTHS = 6
 
 _LOCK = threading.Lock()
 _FILE_RE = re.compile(r"journal-(\d{6})\.jsonl$")
+_EQUITY_FILE_RE = re.compile(r"equity-(\d{6})\.jsonl$")
 
 
 def _ensure_dir() -> None:
@@ -35,6 +36,10 @@ def _ensure_dir() -> None:
 
 def _current_path() -> Path:
     return JOURNAL_DIR / f"journal-{datetime.now(timezone.utc).strftime('%Y%m')}.jsonl"
+
+
+def _current_equity_path() -> Path:
+    return JOURNAL_DIR / f"equity-{datetime.now(timezone.utc).strftime('%Y%m')}.jsonl"
 
 
 def new_trade_id() -> str:
@@ -85,8 +90,59 @@ def log_exit(symbol: str, side: str, fill_price: Optional[float], size_usd: Opti
         log.error(f"journal.log_exit failed for {symbol}: {e}")
 
 
+def log_equity(equity: float, anchor_equity: Optional[float] = None,
+               session_pnl_pct: Optional[float] = None) -> None:
+    """Append one equity datapoint. Cheap (~80 bytes) so callers can ratelimit
+    purely by wall-clock interval — see bot._maybe_log_equity (every 5 min)."""
+    rec: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "equity": float(equity),
+    }
+    if anchor_equity is not None:
+        rec["anchor_equity"] = float(anchor_equity)
+    if session_pnl_pct is not None:
+        rec["session_pnl_pct"] = float(session_pnl_pct)
+    try:
+        _ensure_dir()
+        line = json.dumps(rec, default=str)
+        with _LOCK:
+            with _current_equity_path().open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        log.error(f"journal.log_equity failed: {e}")
+
+
+def iter_equity(since: Optional[datetime] = None):
+    """Yield equity datapoints across all retained equity files, oldest-first."""
+    if not JOURNAL_DIR.exists():
+        return
+    for p in sorted(JOURNAL_DIR.glob("equity-*.jsonl")):
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if since:
+                        ts = rec.get("ts")
+                        if ts:
+                            try:
+                                if datetime.fromisoformat(ts) < since:
+                                    continue
+                            except ValueError:
+                                pass
+                    yield rec
+        except OSError as e:
+            log.warning(f"Could not read {p.name}: {e}")
+
+
 def purge_old(months: int = RETENTION_MONTHS) -> int:
-    """Delete journal-YYYYMM.jsonl files older than `months` calendar months."""
+    """Delete journal-YYYYMM.jsonl AND equity-YYYYMM.jsonl files older than
+    `months` calendar months. Returns total count deleted."""
     if not JOURNAL_DIR.exists():
         return 0
     now = datetime.now(timezone.utc).replace(day=1)
@@ -97,25 +153,29 @@ def purge_old(months: int = RETENTION_MONTHS) -> int:
     cutoff_yyyymm = cutoff.strftime("%Y%m")
 
     deleted = 0
-    for p in JOURNAL_DIR.glob("journal-*.jsonl"):
-        m = _FILE_RE.search(p.name)
-        if not m:
-            continue
-        if m.group(1) < cutoff_yyyymm:
-            try:
-                p.unlink()
-                deleted += 1
-                log.info(f"Purged old journal {p.name}")
-            except OSError as e:
-                log.warning(f"Could not delete {p.name}: {e}")
+    for pattern, regex in (("journal-*.jsonl", _FILE_RE),
+                           ("equity-*.jsonl", _EQUITY_FILE_RE)):
+        for p in JOURNAL_DIR.glob(pattern):
+            m = regex.search(p.name)
+            if not m:
+                continue
+            if m.group(1) < cutoff_yyyymm:
+                try:
+                    p.unlink()
+                    deleted += 1
+                    log.info(f"Purged old file {p.name}")
+                except OSError as e:
+                    log.warning(f"Could not delete {p.name}: {e}")
     return deleted
 
 
 def list_files() -> list[Path]:
-    """Return all journal files newest-first (used by dashboard download)."""
+    """All retained files (trade journal + equity log) newest-first.
+    Used by dashboard download zip."""
     if not JOURNAL_DIR.exists():
         return []
-    return sorted(JOURNAL_DIR.glob("journal-*.jsonl"), reverse=True)
+    files = list(JOURNAL_DIR.glob("journal-*.jsonl")) + list(JOURNAL_DIR.glob("equity-*.jsonl"))
+    return sorted(files, reverse=True)
 
 
 def iter_records(since: Optional[datetime] = None):

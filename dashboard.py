@@ -15,7 +15,8 @@ import io
 import os
 import traceback
 import zipfile
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread
 from typing import Any, Optional
 
@@ -336,6 +337,104 @@ def api_apply_suggestion():
     return jsonify({
         "ok": True,
         "applied": {"TRADE_SIZE_MULTIPLIER": new_mult, "DAILY_LOSS_LIMIT": new_loss},
+    })
+
+
+def _parse_days(default: int = 30, cap: int = 365) -> int:
+    """Parse ?days=N from query string, clamped to [1, cap]."""
+    try:
+        n = int(request.args.get("days", default))
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(cap, n))
+
+
+def _downsample(points: list[dict], max_points: int) -> list[dict]:
+    """Reservoir-style stride sampling. Keeps first + last point intact."""
+    n = len(points)
+    if n <= max_points or max_points < 3:
+        return points
+    stride = (n - 1) / (max_points - 1)
+    out = [points[int(round(i * stride))] for i in range(max_points - 1)]
+    out.append(points[-1])
+    return out
+
+
+@app.route("/api/equity-history")
+def api_equity_history():
+    """Equity datapoints for charting. Returns oldest-first.
+
+    Query: ?days=N (1-365, default 30). Auto-downsamples to <=2000 points so
+    long lookbacks stay snappy in the browser.
+    """
+    days = _parse_days(default=30, cap=365)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    points = [
+        {"ts": r["ts"], "equity": r["equity"],
+         "session_pnl_pct": r.get("session_pnl_pct")}
+        for r in journal.iter_equity(since=since)
+    ]
+    sampled = _downsample(points, max_points=2000)
+    return jsonify({
+        "ok": True,
+        "days": days,
+        "raw_count": len(points),
+        "returned_count": len(sampled),
+        "points": sampled,
+    })
+
+
+@app.route("/api/pnl-by-symbol")
+def api_pnl_by_symbol():
+    """Aggregate REALISED PnL per symbol from EXIT records over the lookback window.
+
+    Query: ?days=N (1-365, default 30).
+    """
+    days = _parse_days(default=30, cap=365)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    agg: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"trades": 0, "wins": 0, "losses": 0, "total_pnl_usd": 0.0}
+    )
+    for r in journal.iter_records(since=since):
+        if r.get("type") != "EXIT":
+            continue
+        sym = r.get("symbol") or "?"
+        pnl = (r.get("exit_context") or {}).get("pnl_usd")
+        if pnl is None:
+            continue
+        try:
+            pnl_f = float(pnl)
+        except (TypeError, ValueError):
+            continue
+        b = agg[sym]
+        b["trades"] += 1
+        b["total_pnl_usd"] += pnl_f
+        if pnl_f > 0:
+            b["wins"] += 1
+        elif pnl_f < 0:
+            b["losses"] += 1
+
+    by_symbol = []
+    for sym in sorted(agg.keys()):
+        b = agg[sym]
+        n = b["trades"]
+        by_symbol.append({
+            "symbol": sym,
+            "trades": n,
+            "wins": b["wins"],
+            "losses": b["losses"],
+            "win_rate": round(b["wins"] / n, 3) if n else 0.0,
+            "total_pnl_usd": round(b["total_pnl_usd"], 4),
+            "avg_pnl_usd": round(b["total_pnl_usd"] / n, 4) if n else 0.0,
+        })
+
+    return jsonify({
+        "ok": True,
+        "days": days,
+        "by_symbol": by_symbol,
+        "total_pnl_usd": round(sum(b["total_pnl_usd"] for b in agg.values()), 4),
+        "total_trades": sum(b["trades"] for b in agg.values()),
     })
 
 
