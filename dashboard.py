@@ -323,12 +323,17 @@ def api_set_config():
                 cfg[k] = v
         if validated_symbol_configs is not None:
             # Merge — partial submissions only affect the symbols included.
+            # CRITICAL: preserve `applied_leverage` (managed by bot._sync_leverage)
+            # so dashboard edits don't reset the persistent leverage cache and
+            # cause bot to re-push leverage on the next tick.
             current_sc = dict(cfg.get("symbol_configs") or {})
             sc_diff: dict[str, Any] = {}
             for sym, body in validated_symbol_configs.items():
-                if current_sc.get(sym) != body:
-                    sc_diff[sym] = {"from": current_sc.get(sym), "to": body}
-                    current_sc[sym] = body
+                existing = dict(current_sc.get(sym) or {})
+                merged = {**existing, **body}  # body wins on overlapping keys
+                if current_sc.get(sym) != merged:
+                    sc_diff[sym] = {"from": current_sc.get(sym), "to": merged}
+                    current_sc[sym] = merged
             if sc_diff:
                 changed["symbol_configs"] = sc_diff
                 cfg["symbol_configs"] = current_sc

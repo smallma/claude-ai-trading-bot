@@ -42,9 +42,10 @@ _last_equity_log_ts: float = 0.0
 # mark, which means a position already past +30% would re-arm from current ROE.
 _position_max_roe: dict[str, float] = {}
 
-# Last leverage value pushed to the exchange per symbol. Empty after a restart
-# so the first tick re-syncs whatever the dashboard config says, idempotently.
-_applied_leverage: dict[str, int] = {}
+# Persistent leverage cache lives in config.json under
+# symbol_configs[sym].applied_leverage so it survives bot restarts and we
+# never call Hyperliquid's update_leverage when the desired value matches
+# what's already there. The dashboard preserves this field across edits.
 
 # Per-symbol entry meta for matching ENTRY <-> EXIT in the journal. Reset on
 # bot restart, so any pre-existing position will EXIT-journal with trade_id=None
@@ -646,22 +647,43 @@ def _resolve_symbol_config(current_settings: dict[str, Any], symbol: str
 
 def _sync_leverage(client: HyperliquidClient, current_settings: dict[str, Any],
                    symbols: list[str]) -> None:
-    """Push any leverage drift from config.json to Hyperliquid.
+    """Push leverage to Hyperliquid ONLY when the desired value differs from
+    the last successfully-applied value.
 
-    Cheap on cache hit (just a dict lookup). On cache miss / change, makes one
-    `update_leverage` API call per affected symbol. Failures don't crash the
-    tick — they're logged and we leave the cache stale so the next tick
-    retries.
+    Cache lives in config.json under symbol_configs[sym].applied_leverage so
+    it survives bot restarts. Without persistence the first tick after every
+    restart would re-push every symbol's leverage even when nothing changed.
     """
+    sc = current_settings.get("symbol_configs") or {}
+    pushed: dict[str, int] = {}
     for symbol in symbols:
-        _, desired = _resolve_symbol_config(current_settings, symbol)
-        if _applied_leverage.get(symbol) == desired:
+        entry = sc.get(symbol) or {}
+        try:
+            desired = int(entry.get("leverage", config.DEFAULT_LEVERAGE))
+        except (TypeError, ValueError):
+            desired = int(config.DEFAULT_LEVERAGE)
+        applied = entry.get("applied_leverage")
+        try:
+            applied_int = int(applied) if applied is not None else None
+        except (TypeError, ValueError):
+            applied_int = None
+        if applied_int == desired:
+            log.debug(f"[{symbol}] leverage already {desired}x — skip push")
             continue
         try:
             client.update_leverage(symbol, desired, config.DEFAULT_LEVERAGE_IS_CROSS)
-            _applied_leverage[symbol] = desired
+            pushed[symbol] = desired
         except Exception as e:
             log.error(f"[{symbol}] update_leverage to {desired}x failed: {e}")
+
+    # Persist successful pushes so the next tick / restart can short-circuit.
+    # Re-load to merge with any concurrent dashboard edits to other fields.
+    if pushed:
+        cfg = settings.load()
+        live_sc = cfg.setdefault("symbol_configs", {})
+        for sym, lev in pushed.items():
+            live_sc.setdefault(sym, {})["applied_leverage"] = lev
+        settings.save(cfg)
 
 
 def _maybe_log_equity(equity: float, kill: KillSwitch) -> None:

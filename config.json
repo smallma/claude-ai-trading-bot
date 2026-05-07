@@ -8,15 +8,18 @@
   "symbol_configs": {
     "SOL": {
       "base_usd": 40.0,
-      "leverage": 1
+      "leverage": 1,
+      "applied_leverage": 1
     },
     "ETH": {
       "base_usd": 40.0,
-      "leverage": 1
+      "leverage": 1,
+      "applied_leverage": 1
     },
     "ADA": {
       "base_usd": 20.0,
-      "leverage": 1
+      "leverage": 1,
+      "applied_leverage": 1
     }
   },
   "symbols": [

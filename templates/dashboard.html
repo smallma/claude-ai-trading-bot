@@ -277,40 +277,9 @@ function renderConfig(s) {
   const sc = cfg.symbol_configs || {};
 
   $("cfg-static").innerHTML = `
-    <dt>Symbols (active)</dt>
-    <dd>
-      <input type="text" id="ed-symbols" value="${symbols.join(", ")}"
-             style="width:100%; min-width:220px"
-             placeholder="comma-separated, e.g. SOL, ETH, BTC">
-      <div class="muted small" style="margin-top:2px">
-        Bot picks up changes on the next tick. New symbols auto-seed
-        symbol_configs at $${stat.NEW_SYMBOL_DEFAULT_BASE_USD ?? 20}/${stat.NEW_SYMBOL_DEFAULT_LEVERAGE ?? 20}x.
-      </div>
-    </dd>
     <dt>RSI thresholds</dt><dd>${stat.RSI_OVERSOLD} / ${stat.RSI_OVERBOUGHT} (locked)</dd>
     <dt>AI refresh</dt><dd>${stat.AI_REFRESH_SECONDS}s</dd>
   `;
-
-  const symbolRows = symbols.map(sym => {
-    const entry = sc[sym] || {};
-    const defaultBase = (stat.BASE_TRADE_SIZE_USD || {})[sym];
-    const base = entry.base_usd ?? defaultBase ?? 0;
-    const lev  = entry.leverage  ?? 1;
-    return `
-      <div class="row" style="gap:6px; align-items:center">
-        <strong style="min-width:42px">${sym}</strong>
-        <label class="muted small">Base USD
-          <input type="number" id="ed-base-${sym}" step="1" min="1" max="10000"
-                 value="${base}" style="width:100px">
-        </label>
-        <label class="muted small">Leverage
-          <input type="number" id="ed-lev-${sym}" step="1" min="1" max="50"
-                 value="${lev}" style="width:80px">
-        </label>
-        ${defaultBase !== undefined && Number(defaultBase) !== Number(base)
-          ? `<span class="muted small">(config.py default $${defaultBase})</span>` : ""}
-      </div>`;
-  }).join("");
 
   const ed = $("cfg-editor");
   ed.innerHTML = `
@@ -338,35 +307,182 @@ function renderConfig(s) {
     </div>
     <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
       <div class="muted small" style="margin-bottom:6px; text-transform:uppercase; letter-spacing:0.04em">
-        Per-Symbol Sizing & Leverage
+        Symbols, Sizing & Leverage
       </div>
-      <div style="display:flex; flex-direction:column; gap:6px">${symbolRows}</div>
+      <div id="symbol-table-wrap"></div>
       <div class="muted small" style="margin-top:6px">
-        Leverage changes are pushed to Hyperliquid on the next bot tick.
+        Click <strong>+ Add Symbol</strong> to grow the table; ✕ removes a row.
+        Save Config commits the whole table — symbols list and per-symbol
+        sizing in one round trip. Leverage changes only push to Hyperliquid
+        when the value actually changes (cache lives in config.json).
       </div>
     </div>
   `;
+
+  initSymbolRowsFromState();
+  renderSymbolTable();
+}
+
+// ===== Dynamic symbol table =====
+//
+// State lives in _symbolRows: [{id, sym, base, lev, applied}, ...]. Each row
+// has a stable client-side id so re-renders don't lose typed values when a
+// neighbour is added or removed.
+
+let _symbolRows = [];
+let _nextRowId = 1;
+let _symbolRowsInitialized = false;
+let _symbolRowsDirty = false;
+
+function initSymbolRowsFromState() {
+  // Re-init wipes user input, so guard against the periodic refresh trampling
+  // a half-typed row. Allow init on first render or right after a successful
+  // Save (where the operator explicitly synced state).
+  if (_symbolRowsInitialized && _symbolRowsDirty) return;
+  return _initSymbolRowsFromStateForce();
+}
+
+function _initSymbolRowsFromStateForce() {
+  const cfg = (LAST_STATE && LAST_STATE.config) || {};
+  const stat = (LAST_STATE && LAST_STATE.static) || {};
+  const symbols = (stat.SYMBOLS || []);
+  const sc = cfg.symbol_configs || {};
+  const fallbackBase = (sym) => (stat.BASE_TRADE_SIZE_USD || {})[sym] ?? stat.NEW_SYMBOL_DEFAULT_BASE_USD ?? 20;
+  const fallbackLev = stat.NEW_SYMBOL_DEFAULT_LEVERAGE ?? 1;
+  _symbolRows = symbols.map(sym => {
+    const entry = sc[sym] || {};
+    return {
+      id: _nextRowId++,
+      sym,
+      base: entry.base_usd ?? fallbackBase(sym),
+      lev:  entry.leverage  ?? fallbackLev,
+      applied: entry.applied_leverage,
+    };
+  });
+  _symbolRowsInitialized = true;
+  _symbolRowsDirty = false;
+}
+
+function _captureSymbolRowEdits() {
+  // Pull whatever is currently typed into the row inputs back into the model
+  // so add/remove ops don't blow away unsaved edits.
+  for (const r of _symbolRows) {
+    const symEl  = document.getElementById("row-sym-" + r.id);
+    const baseEl = document.getElementById("row-base-" + r.id);
+    const levEl  = document.getElementById("row-lev-" + r.id);
+    if (symEl)  r.sym  = symEl.value.toUpperCase();
+    if (baseEl) r.base = baseEl.value;
+    if (levEl)  r.lev  = levEl.value;
+  }
+}
+
+function addSymbolRow() {
+  _captureSymbolRowEdits();
+  const stat = (LAST_STATE && LAST_STATE.static) || {};
+  _symbolRows.push({
+    id: _nextRowId++,
+    sym: "",
+    base: stat.NEW_SYMBOL_DEFAULT_BASE_USD ?? 20,
+    lev:  stat.NEW_SYMBOL_DEFAULT_LEVERAGE ?? 20,
+    applied: undefined,
+  });
+  _symbolRowsDirty = true;
+  renderSymbolTable();
+  setTimeout(() => {
+    const last = _symbolRows[_symbolRows.length - 1];
+    document.getElementById("row-sym-" + last.id)?.focus();
+  }, 0);
+}
+
+function removeSymbolRow(rowId) {
+  _captureSymbolRowEdits();
+  _symbolRows = _symbolRows.filter(r => r.id !== rowId);
+  _symbolRowsDirty = true;
+  renderSymbolTable();
+}
+
+function renderSymbolTable() {
+  const wrap = $("symbol-table-wrap");
+  if (!wrap) return;
+  if (_symbolRows.length === 0) {
+    wrap.innerHTML = `
+      <div class="muted small" style="margin-bottom:8px">
+        No symbols configured. Click + Add Symbol below.
+      </div>
+      <button class="secondary" onclick="addSymbolRow()">+ Add Symbol</button>`;
+    return;
+  }
+  const stat = (LAST_STATE && LAST_STATE.static) || {};
+  const cfg = (LAST_STATE && LAST_STATE.config) || {};
+  const sc = cfg.symbol_configs || {};
+  const rows = _symbolRows.map(r => {
+    const sym = r.sym || "";
+    const isNew = sym && !sc[sym];
+    const newBadge = isNew
+      ? `<span class="pill skip" style="margin-left:4px" title="Will auto-seed on save">NEW</span>` : "";
+    const appliedHint = (r.applied !== undefined && r.applied !== null && Number(r.applied) !== Number(r.lev))
+      ? `<span class="muted small" style="margin-left:6px" title="Bot will push the new leverage on the next tick">applied ${r.applied}x</span>` : "";
+    return `
+      <tr>
+        <td><input type="text" id="row-sym-${r.id}" value="${sym}"
+                   placeholder="SYMBOL" maxlength="15"
+                   style="width:90px; text-transform:uppercase"
+                   oninput="this.value=this.value.toUpperCase(); _symbolRowsDirty=true"></td>
+        <td><input type="number" id="row-base-${r.id}" step="1" min="1" max="10000"
+                   value="${r.base}" style="width:90px"
+                   oninput="_symbolRowsDirty=true"></td>
+        <td><input type="number" id="row-lev-${r.id}" step="1" min="1" max="50"
+                   value="${r.lev}" style="width:70px"
+                   oninput="_symbolRowsDirty=true"></td>
+        <td>${newBadge}${appliedHint}</td>
+        <td style="text-align:right">
+          <button class="secondary" title="Remove row"
+                  onclick="removeSymbolRow(${r.id})"
+                  style="padding:2px 8px">✕</button>
+        </td>
+      </tr>`;
+  }).join("");
+  wrap.innerHTML = `
+    <table style="width:100%; border-collapse:collapse">
+      <thead>
+        <tr>
+          <th style="text-align:left">Symbol</th>
+          <th style="text-align:left">Base USD</th>
+          <th style="text-align:left">Leverage</th>
+          <th></th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div style="margin-top:8px">
+      <button class="secondary" onclick="addSymbolRow()">+ Add Symbol</button>
+    </div>`;
 }
 
 async function saveConfig() {
-  const currentSymbols = (LAST_STATE && LAST_STATE.static && LAST_STATE.static.SYMBOLS) || [];
+  // Pull edits straight from the table — single source of truth.
+  _captureSymbolRowEdits();
+
+  const symbolsList = [];
   const symbolConfigs = {};
-  for (const sym of currentSymbols) {
-    const baseEl = $("ed-base-" + sym);
-    const levEl  = $("ed-lev-" + sym);
-    if (!baseEl || !levEl) continue;
-    const base = parseFloat(baseEl.value);
-    const lev  = parseInt(levEl.value, 10);
+  const seen = new Set();
+  for (const r of _symbolRows) {
+    const sym = (r.sym || "").trim().toUpperCase();
+    if (!sym) continue;  // empty rows ignored silently
+    if (!/^[A-Z0-9]{1,15}$/.test(sym)) {
+      toast(`Invalid symbol: ${sym}`, "err"); return;
+    }
+    if (seen.has(sym)) continue;  // dedupe
+    seen.add(sym);
+    const base = parseFloat(r.base);
+    const lev  = parseInt(r.lev, 10);
     if (Number.isNaN(base)) { toast(`${sym}: base USD is not a number`, "err"); return; }
     if (Number.isNaN(lev))  { toast(`${sym}: leverage is not an integer`, "err"); return; }
+    symbolsList.push(sym);
     symbolConfigs[sym] = { base_usd: base, leverage: lev };
   }
-
-  const symbolsRaw = ($("ed-symbols")?.value || "").trim();
-  const symbolsList = symbolsRaw
-    ? symbolsRaw.split(/[,\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean)
-    : [];
-  if (symbolsList.length === 0) { toast("Symbols list cannot be empty", "err"); return; }
+  if (symbolsList.length === 0) { toast("Need at least 1 symbol row", "err"); return; }
 
   const body = {
     TRADE_SIZE_MULTIPLIER: parseFloat($("ed-mult").value),
@@ -387,6 +503,9 @@ async function saveConfig() {
     if (!r.ok) throw new Error(j.error || "save failed");
     const n = Object.keys(j.changed || {}).length;
     toast(n ? `Saved ${n} field(s)` : "No changes", n ? "ok" : "err");
+    // Server is source of truth after save — let refresh re-sync the table.
+    _symbolRowsDirty = false;
+    _symbolRowsInitialized = false;
     refresh();
   } catch (e) {
     toast(String(e), "err");
