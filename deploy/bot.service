@@ -1,0 +1,23 @@
+[Unit]
+Description=Hyperliquid Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Adjust User and paths to match your VM.
+User=rain
+WorkingDirectory=/home/rain/claude-ai-trading-bot
+EnvironmentFile=/home/rain/claude-ai-trading-bot/.env
+ExecStart=/home/rain/claude-ai-trading-bot/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/rain/claude-ai-trading-bot
+
+[Install]
+WantedBy=multi-user.target
