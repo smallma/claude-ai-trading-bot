@@ -13,9 +13,10 @@ in deploy/Caddyfile, never directly. NEVER bind 0.0.0.0 here.
 """
 import io
 import os
+import traceback
 import zipfile
 from datetime import datetime, timezone
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 import config
 import journal
 import settings
+import strategy_reviewer
 from exchange import HyperliquidClient
 from logger import get_logger
 
@@ -33,6 +35,17 @@ log = get_logger("dashboard")
 app = Flask(__name__)
 _save_lock = Lock()
 _client: Optional[HyperliquidClient] = None
+
+# Run-reviewer-on-demand state. Reviewer call (Gemini Pro) takes 20-60s, so we
+# kick it off in a background thread and let the UI poll /api/state.
+_review_lock = Lock()
+_review_state: dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_error": None,
+    "last_lookback_days": None,
+}
 
 # Whitelist of fields the UI is allowed to write into config.json. Anything
 # outside this set is rejected — same shape contract as settings.DEFAULTS.
@@ -152,6 +165,7 @@ def api_state():
         "now": datetime.now(timezone.utc).isoformat(),
         "journal_files": [p.name for p in journal.list_files()],
         "editable_fields": list(EDITABLE_FIELDS.keys()),
+        "review_state": dict(_review_state),
     })
 
 
@@ -221,6 +235,62 @@ def api_apply_strategy_suggestion():
 
     log.info(f"strategy suggestion applied: {overrides}")
     return jsonify({"ok": True, "applied": overrides})
+
+
+def _run_reviewer_bg(lookback_days: int) -> None:
+    """Background thread body — runs reviewer, captures result/error in module state."""
+    try:
+        result = strategy_reviewer.run_once(lookback_days=lookback_days, dry_run=False)
+        with _review_lock:
+            if result is None:
+                # run_once returned None — either too few trades or Gemini failed.
+                # Distinguish by checking journal length quickly.
+                _review_state["last_error"] = (
+                    "reviewer returned no result — check VM logs (likely "
+                    "<5 closed trades or Gemini call failed)"
+                )
+            else:
+                _review_state["last_error"] = None
+    except Exception as e:
+        log.error(f"reviewer bg thread crashed: {e}\n{traceback.format_exc()}")
+        with _review_lock:
+            _review_state["last_error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _review_lock:
+            _review_state["running"] = False
+            _review_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.route("/api/run-reviewer", methods=["POST"])
+def api_run_reviewer():
+    """Kick off strategy_reviewer in a background thread. Returns 202 + state.
+
+    Optional body: {"lookback_days": 30}. UI polls /api/state.review_state to
+    see when it finishes; the suggestion shows up under ai_meta.suggested_strategy.
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        lookback = int(payload.get("lookback_days", strategy_reviewer.DEFAULT_LOOKBACK_DAYS))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "lookback_days must be an integer"}), 400
+    if not (1 <= lookback <= 180):
+        return jsonify({"ok": False, "error": "lookback_days must be 1-180"}), 400
+
+    with _review_lock:
+        if _review_state["running"]:
+            return jsonify({"ok": False, "error": "reviewer already running",
+                            "state": dict(_review_state)}), 409
+        _review_state.update({
+            "running": True,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "last_error": None,
+            "last_lookback_days": lookback,
+        })
+
+    Thread(target=_run_reviewer_bg, args=(lookback,), daemon=True).start()
+    log.info(f"reviewer dispatched (lookback={lookback}d)")
+    return jsonify({"ok": True, "state": dict(_review_state)}), 202
 
 
 @app.route("/api/clear-strategy-overrides", methods=["POST"])

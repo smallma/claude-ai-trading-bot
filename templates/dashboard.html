@@ -335,9 +335,24 @@ async function clearOverrides() {
 function renderStrategyReview(s) {
   const meta = (s.config && s.config.ai_meta) || {};
   const sugg = meta.suggested_strategy;
+  const rs = s.review_state || {};
   const div = $("strategy-review");
+
+  const runBtn = `
+    <div class="row" style="margin-bottom:10px; gap:8px; align-items:center">
+      <button onclick="runReviewer(7)" ${rs.running ? "disabled" : ""}>${rs.running ? "Running…" : "Run Reviewer (7d)"}</button>
+      <button class="secondary" onclick="runReviewer(30)" ${rs.running ? "disabled" : ""}>Run Reviewer (30d)</button>
+      ${rs.running
+        ? `<span class="muted small">Started ${fmtTs(rs.started_at)} · Gemini Pro takes ~30s</span>`
+        : rs.last_error
+          ? `<span class="danger small">${escapeHtml(rs.last_error)}</span>`
+          : rs.finished_at
+            ? `<span class="muted small">Last run finished ${fmtTs(rs.finished_at)}</span>`
+            : `<span class="muted small">No on-demand run yet</span>`}
+    </div>`;
+
   if (!sugg) {
-    div.innerHTML = `<span class="muted small">No review yet — run <code>strategy_reviewer.py</code> (cron daily).</span>`;
+    div.innerHTML = runBtn + `<span class="muted small">No review yet — click a button above or wait for cron.</span>`;
     return;
   }
   const overrides = sugg.suggested_overrides || {};
@@ -354,7 +369,7 @@ function renderStrategyReview(s) {
     return `<dt>${k}</dt><dd>${v}${liveVal !== undefined ? ` <span class="muted small">(live: ${liveVal})</span>` : ""}<div class="muted small" style="margin-top:2px">${escapeHtml(reason)}</div></dd>`;
   }).join("") || `<dt class="muted">none</dt><dd class="muted">reviewer suggested no changes</dd>`;
   const notes = (sugg.validation_notes || []).map(n => `<li>${escapeHtml(n)}</li>`).join("");
-  div.innerHTML = `
+  div.innerHTML = runBtn + `
     <div class="sugg-box">
       <div class="row" style="justify-content:space-between">
         <strong>Confidence ${fmt(sugg.confidence ?? 0,2)} · ${sugg.stats_summary?.closed_trades ?? "?"} trades / ${sugg.stats_summary?.lookback_days ?? "?"}d</strong>
@@ -368,6 +383,36 @@ function renderStrategyReview(s) {
         <span class="muted small">computed ${fmtTs(sugg.computed_at)}</span>
       </div>
     </div>`;
+}
+
+let _reviewPollTimer = null;
+
+async function runReviewer(lookbackDays) {
+  try {
+    const r = await fetch("/api/run-reviewer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lookback_days: lookbackDays }),
+    });
+    const j = await r.json();
+    if (r.status === 409) { toast("Reviewer already running", "err"); return; }
+    if (!r.ok) throw new Error(j.error || "dispatch failed");
+    toast(`Reviewer running (${lookbackDays}d lookback)…`);
+    refresh();
+    if (_reviewPollTimer) clearInterval(_reviewPollTimer);
+    _reviewPollTimer = setInterval(async () => {
+      await refresh();
+      const rs = LAST_STATE && LAST_STATE.review_state;
+      if (!rs || !rs.running) {
+        clearInterval(_reviewPollTimer);
+        _reviewPollTimer = null;
+        if (rs && rs.last_error) toast("Reviewer failed: " + rs.last_error, "err");
+        else toast("Reviewer finished — see suggestion below");
+      }
+    }, 3000);
+  } catch (e) {
+    toast(String(e), "err");
+  }
 }
 
 async function applyStrategySuggestion() {
