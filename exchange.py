@@ -2,8 +2,9 @@
 
 Isolates SDK calls so the rest of the bot speaks plain Python.
 """
+import math
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from eth_account import Account
 from hyperliquid.exchange import Exchange
@@ -23,7 +24,79 @@ class HyperliquidClient:
         self.account = Account.from_key(private_key)
         self.info = Info(base_url, skip_ws=True)
         self.exchange = Exchange(self.account, base_url, account_address=address)
+        # Per-symbol szDecimals from /info meta. Lazy + cached — Hyperliquid
+        # only changes these on listings/delistings, so a single fetch per
+        # process is fine.
+        self._sz_decimals: Optional[dict[str, int]] = None
         log.info(f"Connected to Hyperliquid {'testnet' if use_testnet else 'mainnet'} as {address}")
+
+    def _ensure_sz_decimals(self) -> dict[str, int]:
+        if self._sz_decimals is None:
+            meta = self.info.meta()
+            self._sz_decimals = {
+                a["name"]: int(a["szDecimals"])
+                for a in meta.get("universe", [])
+                if "name" in a and "szDecimals" in a
+            }
+            log.info(f"Loaded szDecimals for {len(self._sz_decimals)} symbols")
+        return self._sz_decimals
+
+    def round_size_for_symbol(self, symbol: str, sz: float) -> float:
+        """Round size DOWN to the symbol's szDecimals precision.
+
+        Floor (not nearest) so we never overshoot the intended notional.
+        Example: ADA has szDecimals=0 → 75.534 becomes 75 (not 76); SOL has
+        szDecimals=2 → 0.4759 becomes 0.47.
+
+        Hyperliquid rejects any size with finer precision than szDecimals,
+        which is what was producing the "ghost trades" — orders rejected by
+        the exchange but journal-logged as successful.
+        """
+        decimals = self._ensure_sz_decimals().get(symbol)
+        if decimals is None:
+            raise ValueError(f"[{symbol}] no szDecimals available — symbol unknown to Hyperliquid")
+        factor = 10 ** decimals
+        return math.floor(sz * factor) / factor
+
+    @staticmethod
+    def _check_order_response(symbol: str, result: Any) -> dict:
+        """Parse the SDK response and raise unless we see at least one filled
+        or resting order ID. Hyperliquid returns HTTP 200 + status="ok" even
+        when the order is rejected — the rejection lives inside
+        response.data.statuses[i].error, which the SDK does NOT raise on.
+
+        Returns the first valid status dict (with `oid`) for caller logging.
+        """
+        if not isinstance(result, dict):
+            raise RuntimeError(f"[{symbol}] order response was not a dict: {result!r}")
+        if result.get("status") != "ok":
+            raise RuntimeError(f"[{symbol}] order rejected: status={result.get('status')!r} body={result}")
+
+        response = result.get("response") or {}
+        data = response.get("data") or {}
+        statuses = data.get("statuses") or []
+        if not statuses:
+            raise RuntimeError(f"[{symbol}] order rejected: empty statuses ({result})")
+
+        errors: list[str] = []
+        valid: list[dict] = []
+        for s in statuses:
+            if not isinstance(s, dict):
+                errors.append(repr(s))
+                continue
+            if s.get("error"):
+                errors.append(str(s["error"]))
+            elif "filled" in s and isinstance(s["filled"], dict) and s["filled"].get("oid") is not None:
+                valid.append(s["filled"])
+            elif "resting" in s and isinstance(s["resting"], dict) and s["resting"].get("oid") is not None:
+                valid.append(s["resting"])
+            else:
+                # Unknown shape — refuse to assume success.
+                errors.append(f"unrecognized status entry: {s}")
+
+        if errors or not valid:
+            raise RuntimeError(f"[{symbol}] order rejected by exchange: errors={errors} statuses={statuses}")
+        return valid[0]
 
     def get_mid_price(self, symbol: str) -> float:
         mids = self.info.all_mids()
@@ -44,17 +117,33 @@ class HyperliquidClient:
         return closes[-lookback:]
 
     def get_account_equity(self) -> float:
-        # Hyperliquid unified accounts pool spot + perp into one margin set.
-        # marginSummary.accountValue alone reflects only the perp leg, so add
-        # spot USDC to get the true equity used by the unified margin engine.
+        """Perps total equity = marginSummary.accountValue from clearinghouseState.
+
+        This matches the "Perps Total Equity" figure on app.hyperliquid.xyz
+        exactly — it already includes unrealised PnL on open perp positions.
+
+        DO NOT add spot USDC: spot and perp are separate equity buckets in
+        Hyperliquid's accounting, and the kill switch must anchor on the perp
+        bucket alone (otherwise topping up spot would mask perp drawdown).
+
+        DO NOT read walletBalance: that field is the underlying account-level
+        deposit, not the live mark-to-market equity we need for risk checks.
+        """
+        # Info.user_state(address) POSTs {"type": "clearinghouseState", ...}
+        # — confirmed against hyperliquid-python-sdk source.
         perp_state = self.info.user_state(self.address)
-        perp_value = float(perp_state["marginSummary"]["accountValue"])
-        spot_state = self.info.spot_user_state(self.address)
-        spot_usdc = next(
-            (float(b["total"]) for b in spot_state.get("balances", []) if b.get("coin") == "USDC"),
-            0.0,
+
+        # Temporary diagnostic — raw structure dumped so we can sanity-check
+        # against the web UI. Remove after the next deploy verifies the figures match.
+        ms = perp_state.get("marginSummary", {})
+        log.info(
+            f"[equity-debug] marginSummary={ms} "
+            f"crossMarginSummary={perp_state.get('crossMarginSummary', {})} "
+            f"withdrawable={perp_state.get('withdrawable')} "
+            f"assetPositions_count={len(perp_state.get('assetPositions', []))}"
         )
-        return perp_value + spot_usdc
+
+        return float(ms["accountValue"])
 
     def get_open_position(self, symbol: str) -> Optional[dict]:
         """Return position dict if user has a non-zero position in symbol, else None."""
@@ -66,14 +155,51 @@ class HyperliquidClient:
         return None
 
     def market_open(self, symbol: str, is_buy: bool, usd_size: float) -> dict:
-        """Open a market position sized in USD."""
+        """Open a market position sized in USD.
+
+        Returns the raw SDK response on success. Raises RuntimeError if the
+        exchange rejected the order (so callers know NOT to journal a phantom
+        trade). Adds a `_rounded_sz` and `_filled_status` key to the returned
+        dict for caller convenience.
+        """
         price = self.get_mid_price(symbol)
-        sz = self._round_size(usd_size / price)
+        raw_sz = usd_size / price
+        sz = self.round_size_for_symbol(symbol, raw_sz)
         if sz <= 0:
-            raise ValueError(f"Computed size {sz} is non-positive (price={price}, usd={usd_size})")
-        log.info(f"Submitting MARKET {'BUY' if is_buy else 'SELL'} {sz} {symbol} (~${usd_size:.2f} @ ~${price:.4f})")
+            raise ValueError(
+                f"[{symbol}] size {sz} non-positive after szDecimals rounding "
+                f"(raw={raw_sz}, price={price}, usd={usd_size})"
+            )
+        decimals = self._ensure_sz_decimals().get(symbol, "?")
+        log.info(
+            f"Submitting MARKET {'BUY' if is_buy else 'SELL'} {sz} {symbol} "
+            f"(raw {raw_sz:.8f}, szDecimals={decimals}, ~${sz * price:.2f} @ ~${price:.4f})"
+        )
         result = self.exchange.market_open(symbol, is_buy, sz)
         log.info(f"Order result: {result}")
+
+        # SDK returns success even on inner rejection — verify explicitly.
+        filled = self._check_order_response(symbol, result)
+        log.info(f"[{symbol}] order ACCEPTED oid={filled.get('oid')} sz={sz}")
+
+        # Surface the rounded size + filled status to callers without changing
+        # the SDK response shape they already log.
+        if isinstance(result, dict):
+            result["_rounded_sz"] = sz
+            result["_filled_status"] = filled
+        return result
+
+    def update_leverage(self, symbol: str, leverage: int,
+                        is_cross: bool = True) -> dict:
+        """Push a leverage change for `symbol` to Hyperliquid.
+
+        Hyperliquid stores leverage server-side per-symbol-per-account, so this
+        is a one-shot call rather than a per-order parameter. Idempotent: if
+        the value already matches, the SDK still POSTs successfully.
+        """
+        log.info(f"[{symbol}] update_leverage -> {leverage}x ({'cross' if is_cross else 'isolated'})")
+        result = self.exchange.update_leverage(int(leverage), symbol, is_cross)
+        log.info(f"[{symbol}] update_leverage result: {result}")
         return result
 
     def market_close(self, symbol: str) -> Optional[dict]:
@@ -87,7 +213,3 @@ class HyperliquidClient:
         log.info(f"Close result: {result}")
         return result
 
-    @staticmethod
-    def _round_size(sz: float) -> float:
-        # SOL perp on Hyperliquid supports 2 decimal sizes; round down to be safe.
-        return float(int(sz * 100)) / 100.0
