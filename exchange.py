@@ -119,49 +119,23 @@ class HyperliquidClient:
     def get_account_equity(self) -> float:
         """Total Net Equity used by the kill switch and dashboard equity curve.
 
-        Hyperliquid splits liquid USD across two ledgers — perp and spot —
-        and a high-leverage perp position can lock most of perp's accountValue
-        into `totalMarginUsed`, leaving only pennies in `withdrawable`. The
-        kill switch must anchor on the FULL spendable USD pool or it will
-        misread "all margin used" as "almost wiped out" and trip incorrectly.
+        Uses crossMarginSummary.accountValue which already includes:
+            totalMarginUsed + withdrawable + unrealised PnL
 
-        Formula:
-            total_equity =
-                crossMarginSummary.accountValue   # perp = used margin + free + uPnL
-                + spot USDC balance               # cash sitting on spot side
-
-        accountValue ALREADY includes withdrawable + totalMarginUsed + uPnL on
-        the perp side (verified empirically: accountValue ≈ totalMarginUsed +
-        withdrawable). Adding withdrawable on top would double-count.
+        This matches Hyperliquid's "Total Equity" on the Portfolio page.
+        Do NOT add spot USDC on top — in cross-margin mode the same USDC
+        appears in both perp and spot API responses, causing double-count.
         """
         perp_state = self.info.user_state(self.address)
-        # Cross-margin accounts: marginSummary == crossMarginSummary. We prefer
-        # crossMarginSummary so the field name documents the math.
         cms = perp_state.get("crossMarginSummary") or perp_state.get("marginSummary") or {}
         try:
-            perp_value = float(cms.get("accountValue") or 0.0)
+            total = float(cms.get("accountValue") or 0.0)
         except (TypeError, ValueError):
-            perp_value = 0.0
+            total = 0.0
 
-        spot_usdc = 0.0
-        try:
-            spot_state = self.info.spot_user_state(self.address)
-            for b in (spot_state or {}).get("balances", []):
-                if b.get("coin") == "USDC":
-                    spot_usdc = float(b.get("total") or 0.0)
-                    break
-        except Exception as e:
-            log.warning(f"spot USDC fetch failed (assuming 0): {e}")
-
-        total = perp_value + spot_usdc
-
-        # Diagnostic so the user can sanity-check against the web UI on first
-        # deploy. perp_used + withdrawable should equal perp_value; total
-        # should match (Perps Total Equity + Spot USDC) on app.hyperliquid.xyz.
         log.info(
-            f"[equity] total=${total:.4f} = perp=${perp_value:.4f} "
-            f"(used={cms.get('totalMarginUsed')}, withdrawable={perp_state.get('withdrawable')}) "
-            f"+ spotUSDC=${spot_usdc:.4f}"
+            f"[equity] total=${total:.4f} "
+            f"(used={cms.get('totalMarginUsed')}, withdrawable={perp_state.get('withdrawable')})"
         )
         return total
 
