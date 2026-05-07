@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import config
+
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 DEFAULTS: dict[str, Any] = {
@@ -27,6 +29,22 @@ DEFAULTS: dict[str, Any] = {
     # constant names (RSI_OVERSOLD, RSI_OVERBOUGHT, EMA_FAST_PERIOD,
     # EMA_SLOW_PERIOD, BB_PERIOD, BB_STDEV). Empty by default = use config.py.
     "strategy_overrides": {},
+    # Per-symbol live trading parameters edited from the dashboard. Bot reads
+    # these on every tick; leverage changes are pushed to Hyperliquid via
+    # exchange.update_leverage(). Seeded from config.py constants on first load.
+    "symbol_configs": {
+        sym: {
+            "base_usd": float(config.BASE_TRADE_SIZE_USD.get(sym, 0.0)),
+            "leverage": int(config.DEFAULT_LEVERAGE),
+        }
+        for sym in config.SYMBOLS
+    },
+    # Active trading universe — editable from the dashboard. Empty/missing
+    # falls back to config.SYMBOLS in callers.
+    "symbols": list(config.SYMBOLS),
+    # Manual close requests posted by the dashboard. Bot drains this list at
+    # the top of each tick: market_close + journal each entry, then resets [].
+    "force_close_queue": [],
     "ai_meta": {
         "last_sentiment": None,
         "last_updated": None,

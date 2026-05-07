@@ -13,6 +13,7 @@ in deploy/Caddyfile, never directly. NEVER bind 0.0.0.0 here.
 """
 import io
 import os
+import re
 import traceback
 import zipfile
 from collections import defaultdict
@@ -58,6 +59,90 @@ EDITABLE_FIELDS: dict[str, type] = {
     "TRADE_GATE_ENABLED": bool,
 }
 
+# Per-symbol sizing/leverage validation. Bounds are sanity ceilings — change
+# them here if your account legitimately needs larger orders or higher leverage.
+SYMBOL_BASE_USD_BOUNDS = (1.0, 10000.0)
+SYMBOL_LEVERAGE_BOUNDS = (1, 50)
+# Hyperliquid perp tickers are uppercase letters/numbers, 1-15 chars in practice.
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,15}$")
+
+
+def _validate_symbol_token(sym: Any) -> Optional[str]:
+    """Return None if `sym` is a syntactically valid ticker, else error string."""
+    if not isinstance(sym, str):
+        return f"symbol must be a string, got {type(sym).__name__}"
+    if not SYMBOL_PATTERN.match(sym):
+        return f"symbol {sym!r} not in allowed format (uppercase A-Z0-9, 1-15 chars)"
+    return None
+
+
+def _validate_symbols_list(payload: Any) -> tuple[Optional[list[str]], Optional[str]]:
+    """Validate the dashboard-edited active symbols list. Comma-separated input
+    is normalised on the frontend; backend just accepts a list of strings.
+    """
+    if not isinstance(payload, list):
+        return None, "symbols must be a list"
+    if not payload:
+        return None, "symbols list cannot be empty (need at least 1 ticker)"
+    if len(payload) > 20:
+        return None, f"too many symbols ({len(payload)}); cap is 20"
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in payload:
+        if not isinstance(raw, str):
+            return None, f"symbol must be a string, got {type(raw).__name__}"
+        sym = raw.strip().upper()
+        err = _validate_symbol_token(sym)
+        if err:
+            return None, err
+        if sym in seen:
+            continue  # silent dedupe
+        seen.add(sym)
+        out.append(sym)
+    return out, None
+
+
+def _validate_symbol_configs(payload: Any) -> tuple[Optional[dict[str, dict]], Optional[str]]:
+    """Type/bounds-check a symbol_configs dict from the dashboard.
+
+    Returns (validated_dict, None) on success or (None, error_message). Symbol
+    keys are checked for format only (not a config.SYMBOLS membership) so the
+    user can configure a brand-new ticker in the same Save as adding it to the
+    active symbols list.
+    """
+    if not isinstance(payload, dict):
+        return None, "symbol_configs must be an object"
+    out: dict[str, dict] = {}
+    base_lo, base_hi = SYMBOL_BASE_USD_BOUNDS
+    lev_lo, lev_hi = SYMBOL_LEVERAGE_BOUNDS
+    for sym, body in payload.items():
+        err = _validate_symbol_token(sym)
+        if err:
+            return None, err
+        if not isinstance(body, dict):
+            return None, f"{sym}: value must be an object"
+        if "base_usd" not in body or "leverage" not in body:
+            return None, f"{sym}: must include both base_usd and leverage"
+        try:
+            base = float(body["base_usd"])
+        except (TypeError, ValueError):
+            return None, f"{sym}.base_usd: not numeric ({body['base_usd']!r})"
+        if base != base:  # NaN
+            return None, f"{sym}.base_usd: NaN not allowed"
+        if not (base_lo <= base <= base_hi):
+            return None, f"{sym}.base_usd={base} outside [{base_lo}, {base_hi}]"
+        try:
+            lev_raw = float(body["leverage"])
+        except (TypeError, ValueError):
+            return None, f"{sym}.leverage: not numeric ({body['leverage']!r})"
+        if lev_raw != int(lev_raw):
+            return None, f"{sym}.leverage must be an integer (got {lev_raw})"
+        lev = int(lev_raw)
+        if not (lev_lo <= lev <= lev_hi):
+            return None, f"{sym}.leverage={lev} outside [{lev_lo}, {lev_hi}]"
+        out[sym] = {"base_usd": base, "leverage": lev}
+    return out, None
+
 
 def _get_client() -> Optional[HyperliquidClient]:
     """Lazy singleton — read-only Hyperliquid client for position snapshots.
@@ -89,13 +174,14 @@ def _coerce(field: str, value: Any) -> Any:
     return caster(value)
 
 
-def _gather_positions(client: Optional[HyperliquidClient]) -> list[dict]:
+def _gather_positions(client: Optional[HyperliquidClient],
+                      symbols: list[str]) -> list[dict]:
     out: list[dict] = []
     if client is None:
-        for sym in config.SYMBOLS:
+        for sym in symbols:
             out.append({"symbol": sym, "side": "UNKNOWN", "error": "no client"})
         return out
-    for sym in config.SYMBOLS:
+    for sym in symbols:
         try:
             pos = client.get_open_position(sym)
         except Exception as e:
@@ -125,14 +211,24 @@ def _gather_positions(client: Optional[HyperliquidClient]) -> list[dict]:
 
 @app.route("/")
 def index():
-    return render_template("dashboard.html", symbols=config.SYMBOLS)
+    return render_template("dashboard.html")
+
+
+def _active_symbols(cfg: dict) -> list[str]:
+    """Mirror of bot._active_symbols — keep state-API symbols list aligned with
+    whatever the bot would iterate this tick."""
+    syms = cfg.get("symbols")
+    if isinstance(syms, list) and syms:
+        return [str(s).upper() for s in syms]
+    return list(config.SYMBOLS)
 
 
 @app.route("/api/state")
 def api_state():
     cfg = settings.load()
     client = _get_client()
-    positions = _gather_positions(client)
+    active = _active_symbols(cfg)
+    positions = _gather_positions(client, active)
 
     equity: Optional[float] = None
     if client is not None:
@@ -152,7 +248,11 @@ def api_state():
         "equity": equity,
         "trades": recent,
         "static": {
-            "SYMBOLS": config.SYMBOLS,
+            # Active universe (dashboard-editable) — lets the UI render
+            # per-symbol controls without a second round trip.
+            "SYMBOLS": active,
+            # Hardcoded defaults from config.py for "default" labels in the UI.
+            "DEFAULT_SYMBOLS": list(config.SYMBOLS),
             "BASE_TRADE_SIZE_USD": config.BASE_TRADE_SIZE_USD,
             "RSI_OVERSOLD": config.RSI_OVERSOLD,
             "RSI_OVERBOUGHT": config.RSI_OVERBOUGHT,
@@ -161,6 +261,8 @@ def api_state():
             "BB_PERIOD": config.BB_PERIOD,
             "BB_STDEV": config.BB_STDEV,
             "AI_REFRESH_SECONDS": config.AI_REFRESH_SECONDS,
+            "NEW_SYMBOL_DEFAULT_BASE_USD": config.NEW_SYMBOL_DEFAULT_BASE_USD,
+            "NEW_SYMBOL_DEFAULT_LEVERAGE": config.NEW_SYMBOL_DEFAULT_LEVERAGE,
             "USE_TESTNET": config.USE_TESTNET,
         },
         "now": datetime.now(timezone.utc).isoformat(),
@@ -185,11 +287,14 @@ def api_set_config():
     if not isinstance(payload, dict) or not payload:
         return jsonify({"ok": False, "error": "empty or non-object body"}), 400
 
+    # Compound fields handled separately from the simple scalar whitelist.
+    symbol_configs_raw = payload.pop("symbol_configs", None)
+    symbols_raw = payload.pop("symbols", None)
+
     bad = [k for k in payload if k not in EDITABLE_FIELDS]
     if bad:
         return jsonify({"ok": False, "error": f"fields not editable: {bad}"}), 400
 
-    changed: dict[str, Any] = {}
     coerced: dict[str, Any] = {}
     for k, v in payload.items():
         try:
@@ -197,16 +302,89 @@ def api_set_config():
         except (TypeError, ValueError) as e:
             return jsonify({"ok": False, "error": f"bad value for {k}: {e}"}), 400
 
+    validated_symbol_configs: Optional[dict] = None
+    if symbol_configs_raw is not None:
+        validated_symbol_configs, err = _validate_symbol_configs(symbol_configs_raw)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+
+    validated_symbols: Optional[list[str]] = None
+    if symbols_raw is not None:
+        validated_symbols, err = _validate_symbols_list(symbols_raw)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+
+    changed: dict[str, Any] = {}
     with _save_lock:
         cfg = settings.load()
         for k, v in coerced.items():
             if cfg.get(k) != v:
                 changed[k] = {"from": cfg.get(k), "to": v}
                 cfg[k] = v
+        if validated_symbol_configs is not None:
+            # Merge — partial submissions only affect the symbols included.
+            current_sc = dict(cfg.get("symbol_configs") or {})
+            sc_diff: dict[str, Any] = {}
+            for sym, body in validated_symbol_configs.items():
+                if current_sc.get(sym) != body:
+                    sc_diff[sym] = {"from": current_sc.get(sym), "to": body}
+                    current_sc[sym] = body
+            if sc_diff:
+                changed["symbol_configs"] = sc_diff
+                cfg["symbol_configs"] = current_sc
+        if validated_symbols is not None:
+            if cfg.get("symbols") != validated_symbols:
+                changed["symbols"] = {"from": cfg.get("symbols"), "to": validated_symbols}
+                cfg["symbols"] = validated_symbols
+                # Auto-seed any newly-added symbols so bot doesn't crash on
+                # first tick. Mirrors bot._ensure_symbol_configs's defaults.
+                sc = dict(cfg.get("symbol_configs") or {})
+                seeded: dict[str, dict] = {}
+                for sym in validated_symbols:
+                    if sym not in sc:
+                        sc[sym] = {
+                            "base_usd": float(config.NEW_SYMBOL_DEFAULT_BASE_USD),
+                            "leverage": int(config.NEW_SYMBOL_DEFAULT_LEVERAGE),
+                        }
+                        seeded[sym] = sc[sym]
+                if seeded:
+                    cfg["symbol_configs"] = sc
+                    changed.setdefault("symbol_configs", {}).update({
+                        sym: {"from": None, "to": v, "auto_seeded": True}
+                        for sym, v in seeded.items()
+                    })
         settings.save(cfg)
 
     log.info(f"config update via dashboard: {changed}")
     return jsonify({"ok": True, "changed": changed})
+
+
+@app.route("/api/close-position/<symbol>", methods=["POST"])
+def api_close_position(symbol: str):
+    """Append `symbol` to config.json -> force_close_queue. The bot drains the
+    queue at the top of its next tick, market_closes the position, journals
+    the EXIT with reason "manual_close", and removes the entry.
+
+    Idempotent: clicking twice quickly only queues once (deduped). Bot also
+    no-ops gracefully if the symbol has no live position by the time it
+    drains the queue.
+    """
+    sym = (symbol or "").strip().upper()
+    err = _validate_symbol_token(sym)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    with _save_lock:
+        cfg = settings.load()
+        queue = list(cfg.get("force_close_queue") or [])
+        already = sym in {str(s).upper() for s in queue}
+        if not already:
+            queue.append(sym)
+            cfg["force_close_queue"] = queue
+            settings.save(cfg)
+
+    log.warning(f"manual close queued for {sym} (already={already}, queue={queue})")
+    return jsonify({"ok": True, "queued": sym, "already_queued": already, "queue": queue})
 
 
 @app.route("/api/apply-strategy-suggestion", methods=["POST"])
@@ -292,6 +470,117 @@ def api_run_reviewer():
     Thread(target=_run_reviewer_bg, args=(lookback,), daemon=True).start()
     log.info(f"reviewer dispatched (lookback={lookback}d)")
     return jsonify({"ok": True, "state": dict(_review_state)}), 202
+
+
+@app.route("/api/strategy-overrides", methods=["POST"])
+def api_set_strategy_overrides():
+    """Manual strategy override write. Strict validation — refuses to clamp
+    silently like the reviewer does, because a human typo should produce a
+    clear error instead of a stealth value change.
+
+    Body: {"RSI_OVERSOLD": 22, "EMA_FAST_PERIOD": 7, "BB_STDEV": null, ...}
+    A null/empty value REMOVES that override (revert to config.py default for
+    that single key). Unspecified keys are left untouched.
+
+    Bounds and integer constraints come from strategy_reviewer.TUNABLE_BOUNDS
+    so reviewer + manual edits stay in lockstep.
+    """
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict) or not payload:
+        return jsonify({"ok": False, "error": "empty or non-object body"}), 400
+
+    bounds = strategy_reviewer.TUNABLE_BOUNDS
+    int_fields = strategy_reviewer.INT_FIELDS
+
+    bad = [k for k in payload if k not in bounds]
+    if bad:
+        return jsonify({"ok": False,
+                        "error": f"unknown fields: {bad}",
+                        "allowed": list(bounds.keys())}), 400
+
+    # Phase 1 — coerce + range-check each field. We compute the FULL effective
+    # set (current overrides merged with payload) before cross-field checks so
+    # users can change one half of a constrained pair if the other half is
+    # already a compatible default/override.
+    cfg = settings.load()
+    current_overrides: dict[str, Any] = dict(cfg.get("strategy_overrides") or {})
+    pending = dict(current_overrides)
+    removals: list[str] = []
+
+    for k, v in payload.items():
+        # Treat null / empty as "remove this override".
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            if k in pending:
+                removals.append(k)
+                pending.pop(k, None)
+            continue
+        try:
+            num = float(v)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False,
+                            "error": f"{k}: not numeric ({v!r})"}), 400
+        if num != num:  # NaN check
+            return jsonify({"ok": False, "error": f"{k}: NaN not allowed"}), 400
+        lo, hi = bounds[k]
+        if not (lo <= num <= hi):
+            return jsonify({"ok": False,
+                            "error": f"{k}={num} outside allowed range [{lo}, {hi}]"}), 400
+        if k in int_fields:
+            if num != int(num):
+                return jsonify({"ok": False,
+                                "error": f"{k} must be an integer (got {num})"}), 400
+            num = int(num)
+        # If the submitted value equals the config.py default, treat as a
+        # remove instead of storing a redundant override. Saves UI churn when
+        # the user just hits Save without changing anything.
+        default_val = getattr(config, k, None)
+        if default_val is not None and num == default_val:
+            if k in pending:
+                removals.append(k)
+                pending.pop(k, None)
+            continue
+        pending[k] = num
+
+    # Phase 2 — cross-field constraints on the EFFECTIVE values (override or default).
+    def effective(key: str) -> float:
+        if key in pending:
+            return float(pending[key])
+        return float(getattr(config, key))
+
+    rsi_lo = effective("RSI_OVERSOLD")
+    rsi_hi = effective("RSI_OVERBOUGHT")
+    if rsi_hi - rsi_lo < 30:
+        return jsonify({"ok": False,
+                        "error": (f"RSI gap too small: {rsi_lo}/{rsi_hi} (need "
+                                  "RSI_OVERBOUGHT - RSI_OVERSOLD >= 30)")}), 400
+
+    ema_fast = effective("EMA_FAST_PERIOD")
+    ema_slow = effective("EMA_SLOW_PERIOD")
+    if ema_slow < ema_fast + 5:
+        return jsonify({"ok": False,
+                        "error": (f"EMA periods too close: fast={ema_fast} "
+                                  f"slow={ema_slow} (need slow >= fast + 5)")}), 400
+
+    # Phase 3 — persist.
+    diff: dict[str, Any] = {}
+    for k in payload.keys():
+        before = current_overrides.get(k)
+        after = pending.get(k) if k not in removals else None
+        if before != after:
+            diff[k] = {"from": before, "to": after}
+
+    with _save_lock:
+        cfg = settings.load()
+        cfg["strategy_overrides"] = pending
+        settings.save(cfg)
+
+    log.info(f"strategy_overrides updated via dashboard: {diff}")
+    return jsonify({
+        "ok": True,
+        "overrides": pending,
+        "changed": diff,
+        "removed": removals,
+    })
 
 
 @app.route("/api/clear-strategy-overrides", methods=["POST"])
@@ -381,6 +670,147 @@ def api_equity_history():
         "raw_count": len(points),
         "returned_count": len(sampled),
         "points": sampled,
+    })
+
+
+@app.route("/api/ai-confidence-history")
+def api_ai_confidence_history():
+    """Time series of sentiment + gate confidence captured at every ENTRY.
+
+    Each ENTRY in the journal carries the sentiment snapshot that justified
+    the trade, plus the structured gate votes. We project that into three
+    series the UI can plot:
+
+      - sentiment_score    (0-10)
+      - sentiment_confidence (0-1)
+      - gate_go_ratio      (0-1) — share of analysts who voted GO
+
+    Query: ?days=N (1-365, default 30). Returns oldest-first, downsampled.
+    """
+    days = _parse_days(default=30, cap=365)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    points: list[dict[str, Any]] = []
+    for r in journal.iter_records(since=since):
+        if r.get("type") != "ENTRY":
+            continue
+        ctx = r.get("decision_context") or {}
+        sent = ctx.get("sentiment") or {}
+        score = sent.get("score")
+        if score is None:
+            continue  # nothing meaningful to plot for this entry
+        confidence = sent.get("confidence")
+
+        votes = ((ctx.get("ai_gate") or {}).get("votes")) or {}
+        go = sum(1 for v in votes.values() if (v or {}).get("decision") == "GO")
+        total = len(votes)
+        gate_ratio = (go / total) if total else None
+
+        points.append({
+            "ts": r.get("ts"),
+            "symbol": r.get("symbol"),
+            "sentiment_score": score,
+            "sentiment_confidence": confidence,
+            "gate_go_ratio": gate_ratio,
+        })
+
+    sampled = _downsample(points, max_points=2000)
+    return jsonify({
+        "ok": True,
+        "days": days,
+        "raw_count": len(points),
+        "returned_count": len(sampled),
+        "points": sampled,
+    })
+
+
+def _aggregate_pnl_by(records, key_extractor):
+    """Shared aggregator: walks EXIT records, groups by `key_extractor(rec)`."""
+    agg: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"trades": 0, "wins": 0, "losses": 0, "total_pnl_usd": 0.0}
+    )
+    for r in records:
+        if r.get("type") != "EXIT":
+            continue
+        key = key_extractor(r)
+        if key is None:
+            continue
+        pnl = (r.get("exit_context") or {}).get("pnl_usd")
+        if pnl is None:
+            continue
+        try:
+            pnl_f = float(pnl)
+        except (TypeError, ValueError):
+            continue
+        b = agg[str(key)]
+        b["trades"] += 1
+        b["total_pnl_usd"] += pnl_f
+        if pnl_f > 0:
+            b["wins"] += 1
+        elif pnl_f < 0:
+            b["losses"] += 1
+
+    rows = []
+    for k in sorted(agg.keys()):
+        b = agg[k]
+        n = b["trades"]
+        rows.append({
+            "key": k,
+            "trades": n,
+            "wins": b["wins"],
+            "losses": b["losses"],
+            "win_rate": round(b["wins"] / n, 3) if n else 0.0,
+            "total_pnl_usd": round(b["total_pnl_usd"], 4),
+            "avg_pnl_usd": round(b["total_pnl_usd"] / n, 4) if n else 0.0,
+        })
+    rows.sort(key=lambda r: r["total_pnl_usd"], reverse=True)
+    return rows
+
+
+@app.route("/api/pnl-by-trigger")
+def api_pnl_by_trigger():
+    """Realised PnL grouped by the `decision_context.trigger` of the matching ENTRY.
+
+    EXIT records don't carry the trigger themselves, so we build a trade_id ->
+    trigger map from ENTRYs first, then aggregate.
+    """
+    days = _parse_days(default=30, cap=365)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    records = list(journal.iter_records(since=since))
+    trigger_by_id: dict[str, str] = {}
+    for r in records:
+        if r.get("type") == "ENTRY":
+            tid = r.get("trade_id")
+            trig = (r.get("decision_context") or {}).get("trigger")
+            if tid and trig:
+                trigger_by_id[tid] = trig
+
+    rows = _aggregate_pnl_by(
+        records,
+        lambda rec: trigger_by_id.get(rec.get("trade_id")),
+    )
+    return jsonify({
+        "ok": True, "days": days,
+        "by_trigger": rows,
+        "total_pnl_usd": round(sum(r["total_pnl_usd"] for r in rows), 4),
+        "total_trades": sum(r["trades"] for r in rows),
+    })
+
+
+@app.route("/api/pnl-by-exit-reason")
+def api_pnl_by_exit_reason():
+    """Realised PnL grouped by EXIT's exit_reason (trailing_stop / opposite_signal / kill_switch)."""
+    days = _parse_days(default=30, cap=365)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = _aggregate_pnl_by(
+        journal.iter_records(since=since),
+        lambda rec: (rec.get("exit_context") or {}).get("exit_reason"),
+    )
+    return jsonify({
+        "ok": True, "days": days,
+        "by_exit_reason": rows,
+        "total_pnl_usd": round(sum(r["total_pnl_usd"] for r in rows), 4),
+        "total_trades": sum(r["trades"] for r in rows),
     })
 
 

@@ -218,10 +218,11 @@ def _format_market_context(ctx: Optional[dict]) -> str:
 
 
 def _build_round1_prompt(headlines: list[str], fng: Optional[dict],
-                         market_ctx: Optional[dict]) -> str:
+                         market_ctx: Optional[dict],
+                         symbols: list[str]) -> str:
     bullets = "\n".join(f"- {h}" for h in headlines)
     fng_block = f"{fng['value']}/100 ({fng['classification']})" if fng else "(unavailable)"
-    symbols_str = ", ".join(config.SYMBOLS)
+    symbols_str = ", ".join(symbols)
     return f"""You are a crypto market sentiment analyst tuning SHARED parameters
 for an automated perpetual futures bot trading a basket of {symbols_str}.
 Your scoring should reflect the broad crypto regime (it applies to all symbols).
@@ -244,7 +245,8 @@ REASON: <one short sentence>
 def _build_judge_prompt(round1_results: list[tuple[str, dict]], headlines: list[str],
                         fng: Optional[dict], btc_dom: Optional[float],
                         funding_rates: dict[str, Optional[float]],
-                        market_ctx: Optional[dict]) -> str:
+                        market_ctx: Optional[dict],
+                        symbols: list[str]) -> str:
     bullets = "\n".join(f"- {h}" for h in headlines[:8])
     fng_block = f"{fng['value']}/100 ({fng['classification']})" if fng else "n/a"
     dom_block = f"{btc_dom:.2f}%" if btc_dom is not None else "n/a"
@@ -252,7 +254,7 @@ def _build_judge_prompt(round1_results: list[tuple[str, dict]], headlines: list[
         f"  - {sym}: {(r * 100):.4f}%/8h" if r is not None else f"  - {sym}: n/a"
         for sym, r in funding_rates.items()
     ) or "  (none)"
-    symbols_str = ", ".join(config.SYMBOLS)
+    symbols_str = ", ".join(symbols)
 
     r1_summary = "\n".join(
         f"  {name}: score={r['score']}/10 conf={r['confidence']:.2f} — {r['reason']}"
@@ -368,8 +370,8 @@ def _round1_minimax(prompt: str) -> Optional[dict]:
 
 
 def _round3_judge(round1: list[tuple[str, dict]], headlines, fng, btc_dom,
-                  funding_rates, market_ctx) -> Optional[dict]:
-    prompt = _build_judge_prompt(round1, headlines, fng, btc_dom, funding_rates, market_ctx)
+                  funding_rates, market_ctx, symbols) -> Optional[dict]:
+    prompt = _build_judge_prompt(round1, headlines, fng, btc_dom, funding_rates, market_ctx, symbols)
     n = max(1, config.JUDGE_MULTI_SHOT)
     results: list[dict] = []
     for i in range(n):
@@ -411,20 +413,27 @@ def _build_params(parsed: dict) -> dict:
     return {"TRADE_SIZE_MULTIPLIER": 1.0, "DAILY_LOSS_LIMIT": 0.02}
 
 
-def run_once(market_ctx: Optional[dict] = None, client=None) -> Optional[int]:
-    """Multi-round AI cycle. Returns final score or None on total failure."""
-    log.info("AI cycle: fetching headlines + supplementary data...")
+def run_once(market_ctx: Optional[dict] = None, client=None,
+             symbols: Optional[list[str]] = None) -> Optional[int]:
+    """Multi-round AI cycle. Returns final score or None on total failure.
+
+    `symbols` lets bot.py pass the dashboard-edited active universe so prompts
+    and funding-rate lookups stay in sync. Falls back to config.SYMBOLS when
+    invoked standalone (e.g. `python ai_analyst.py`).
+    """
+    syms = symbols or list(config.SYMBOLS)
+    log.info(f"AI cycle: fetching headlines + supplementary data for {syms}...")
     headlines = _fetch_headlines()
     fng = _fetch_fear_greed()
     btc_dom = _fetch_btc_dominance()
-    funding_rates = _fetch_funding_rates(client, config.SYMBOLS)
+    funding_rates = _fetch_funding_rates(client, syms)
     log.info(
         f"AI cycle: {len(headlines)} headlines | FNG={fng} | "
         f"BTC_dom={btc_dom} | funding={funding_rates}"
     )
 
     # Round 1: MiniMax-only (Gemini reserved for trade gate)
-    r1_prompt = _build_round1_prompt(headlines, fng, market_ctx)
+    r1_prompt = _build_round1_prompt(headlines, fng, market_ctx, syms)
     minimax_r = _round1_minimax(r1_prompt)
     log.info(f"Round 1: minimax={minimax_r and minimax_r['score']}/10")
 
@@ -435,7 +444,7 @@ def run_once(market_ctx: Optional[dict] = None, client=None) -> Optional[int]:
     round1: list[tuple[str, dict]] = [("MiniMax", minimax_r)]
 
     # Round 3: MiniMax judge (multi-shot, median)
-    final = _round3_judge(round1, headlines, fng, btc_dom, funding_rates, market_ctx)
+    final = _round3_judge(round1, headlines, fng, btc_dom, funding_rates, market_ctx, syms)
     if final is None:
         log.warning("AI cycle: judge failed; falling back to Round 1 result.")
         final = minimax_r

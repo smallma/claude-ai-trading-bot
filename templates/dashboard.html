@@ -56,6 +56,7 @@
            border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
   button.secondary { background: var(--panel); color: var(--fg); border: 1px solid var(--border); }
   button.warn { background: var(--amber); color: #0d1117; }
+  button.danger { background: var(--red); color: #0d1117; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   input[type=number], input[type=text] {
     background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
@@ -72,7 +73,10 @@
   .sugg-box { border: 1px dashed var(--amber); padding: 10px; border-radius: 6px;
               background: rgba(210,153,34,0.05); }
   .chart-grid { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); }
-  @media (max-width: 1100px) { .chart-grid { grid-template-columns: 1fr; } }
+  .chart-grid-equal { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+  @media (max-width: 1100px) {
+    .chart-grid, .chart-grid-equal { grid-template-columns: 1fr; }
+  }
   .chart-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
                 padding: 10px; }
   .chart-wrap h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted);
@@ -143,6 +147,22 @@
         <canvas id="chart-pnl" class="chart-canvas"></canvas>
       </div>
     </div>
+    <div style="margin-top:16px">
+      <div class="chart-wrap">
+        <h3>AI Confidence History <span class="muted" id="conf-meta"></span></h3>
+        <canvas id="chart-confidence" class="chart-canvas" style="height:240px !important"></canvas>
+      </div>
+    </div>
+    <div class="chart-grid-equal" style="margin-top:16px">
+      <div class="chart-wrap">
+        <h3>Realised PnL by Trigger <span class="muted" id="trig-meta"></span></h3>
+        <canvas id="chart-trigger" class="chart-canvas"></canvas>
+      </div>
+      <div class="chart-wrap">
+        <h3>Realised PnL by Exit Reason <span class="muted" id="exit-meta"></span></h3>
+        <canvas id="chart-exit" class="chart-canvas"></canvas>
+      </div>
+    </div>
   </section>
 
   <section class="panel" style="grid-column: 1 / -1">
@@ -201,6 +221,8 @@ async function refresh() {
 function renderPositions(s) {
   const grid = $("positions");
   grid.innerHTML = "";
+  const queue = (s.config && s.config.force_close_queue) || [];
+  const queuedSet = new Set(queue.map(x => String(x).toUpperCase()));
   for (const p of s.positions) {
     const div = document.createElement("div");
     const isFlat = p.side === "FLAT" || p.side === "UNKNOWN" || p.side === "ERROR";
@@ -212,12 +234,18 @@ function renderPositions(s) {
       <strong>${p.symbol}</strong><span class="pill ${pillCls}">${p.side}</span></div>`;
     if (!isFlat) {
       const roeCls = p.roe_pct == null ? "" : (p.roe_pct >= 0 ? "pos" : "neg");
+      const isQueued = queuedSet.has(p.symbol);
       body += `<div class="kv small" style="margin-top:8px">
         <dt>Size</dt><dd>${fmt(p.size, 4)}</dd>
         <dt>Entry</dt><dd>$${fmt(p.entry_price, 4)}</dd>
         <dt>PnL</dt><dd>$${fmt(p.unrealized_pnl, 4)}</dd>
         <dt>Margin</dt><dd>$${fmt(p.margin_used, 2)}</dd>
         <dt>ROE</dt><dd class="roe ${roeCls}">${p.roe_pct != null ? fmt(p.roe_pct,2)+'%' : '—'}</dd>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="danger" onclick="closePosition('${p.symbol}')" ${isQueued ? "disabled" : ""}>
+          ${isQueued ? "Close Queued…" : "Close Position"}
+        </button>
       </div>`;
     } else if (p.error) {
       body += `<div class="small danger">${p.error}</div>`;
@@ -227,15 +255,63 @@ function renderPositions(s) {
   }
 }
 
+async function closePosition(symbol) {
+  if (!confirm(`Market-close ${symbol}? This will issue a manual_close on the next bot tick.`)) return;
+  try {
+    const r = await fetch(`/api/close-position/${encodeURIComponent(symbol)}`, { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "queue failed");
+    toast(j.already_queued
+      ? `${symbol} already in queue`
+      : `${symbol} queued for close — bot will execute on next tick`);
+    refresh();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
 function renderConfig(s) {
   const cfg = s.config || {};
   const stat = s.static || {};
+  const symbols = stat.SYMBOLS || [];
+  const sc = cfg.symbol_configs || {};
+
   $("cfg-static").innerHTML = `
-    <dt>Symbols</dt><dd>${(stat.SYMBOLS || []).join(", ")}</dd>
-    <dt>Base USD</dt><dd>${Object.entries(stat.BASE_TRADE_SIZE_USD || {}).map(([k,v])=>`${k}=$${v}`).join(" / ")}</dd>
+    <dt>Symbols (active)</dt>
+    <dd>
+      <input type="text" id="ed-symbols" value="${symbols.join(", ")}"
+             style="width:100%; min-width:220px"
+             placeholder="comma-separated, e.g. SOL, ETH, BTC">
+      <div class="muted small" style="margin-top:2px">
+        Bot picks up changes on the next tick. New symbols auto-seed
+        symbol_configs at $${stat.NEW_SYMBOL_DEFAULT_BASE_USD ?? 20}/${stat.NEW_SYMBOL_DEFAULT_LEVERAGE ?? 20}x.
+      </div>
+    </dd>
     <dt>RSI thresholds</dt><dd>${stat.RSI_OVERSOLD} / ${stat.RSI_OVERBOUGHT} (locked)</dd>
     <dt>AI refresh</dt><dd>${stat.AI_REFRESH_SECONDS}s</dd>
   `;
+
+  const symbolRows = symbols.map(sym => {
+    const entry = sc[sym] || {};
+    const defaultBase = (stat.BASE_TRADE_SIZE_USD || {})[sym];
+    const base = entry.base_usd ?? defaultBase ?? 0;
+    const lev  = entry.leverage  ?? 1;
+    return `
+      <div class="row" style="gap:6px; align-items:center">
+        <strong style="min-width:42px">${sym}</strong>
+        <label class="muted small">Base USD
+          <input type="number" id="ed-base-${sym}" step="1" min="1" max="10000"
+                 value="${base}" style="width:100px">
+        </label>
+        <label class="muted small">Leverage
+          <input type="number" id="ed-lev-${sym}" step="1" min="1" max="50"
+                 value="${lev}" style="width:80px">
+        </label>
+        ${defaultBase !== undefined && Number(defaultBase) !== Number(base)
+          ? `<span class="muted small">(config.py default $${defaultBase})</span>` : ""}
+      </div>`;
+  }).join("");
+
   const ed = $("cfg-editor");
   ed.innerHTML = `
     <div class="row">
@@ -260,16 +336,46 @@ function renderConfig(s) {
         AUTO_STRATEGY_EVOLVE
       </label>
     </div>
+    <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
+      <div class="muted small" style="margin-bottom:6px; text-transform:uppercase; letter-spacing:0.04em">
+        Per-Symbol Sizing & Leverage
+      </div>
+      <div style="display:flex; flex-direction:column; gap:6px">${symbolRows}</div>
+      <div class="muted small" style="margin-top:6px">
+        Leverage changes are pushed to Hyperliquid on the next bot tick.
+      </div>
+    </div>
   `;
 }
 
 async function saveConfig() {
+  const currentSymbols = (LAST_STATE && LAST_STATE.static && LAST_STATE.static.SYMBOLS) || [];
+  const symbolConfigs = {};
+  for (const sym of currentSymbols) {
+    const baseEl = $("ed-base-" + sym);
+    const levEl  = $("ed-lev-" + sym);
+    if (!baseEl || !levEl) continue;
+    const base = parseFloat(baseEl.value);
+    const lev  = parseInt(levEl.value, 10);
+    if (Number.isNaN(base)) { toast(`${sym}: base USD is not a number`, "err"); return; }
+    if (Number.isNaN(lev))  { toast(`${sym}: leverage is not an integer`, "err"); return; }
+    symbolConfigs[sym] = { base_usd: base, leverage: lev };
+  }
+
+  const symbolsRaw = ($("ed-symbols")?.value || "").trim();
+  const symbolsList = symbolsRaw
+    ? symbolsRaw.split(/[,\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean)
+    : [];
+  if (symbolsList.length === 0) { toast("Symbols list cannot be empty", "err"); return; }
+
   const body = {
     TRADE_SIZE_MULTIPLIER: parseFloat($("ed-mult").value),
     DAILY_LOSS_LIMIT: parseFloat($("ed-loss").value),
     TRADE_GATE_ENABLED: $("ed-gate").checked,
     AUTO_CAPITAL_TUNE: $("ed-cap").checked,
     AUTO_STRATEGY_EVOLVE: $("ed-evo").checked,
+    symbols: symbolsList,
+    symbol_configs: symbolConfigs,
   };
   try {
     const r = await fetch("/api/config", {
@@ -333,6 +439,14 @@ async function applySuggestion() {
 }
 
 const STRATEGY_KEYS = ["RSI_OVERSOLD","RSI_OVERBOUGHT","EMA_FAST_PERIOD","EMA_SLOW_PERIOD","BB_PERIOD","BB_STDEV"];
+const STRATEGY_META = {
+  RSI_OVERSOLD:    { step: 0.5, range: "10–40" },
+  RSI_OVERBOUGHT:  { step: 0.5, range: "60–90" },
+  EMA_FAST_PERIOD: { step: 1,   range: "5–20",   integer: true },
+  EMA_SLOW_PERIOD: { step: 1,   range: "15–60",  integer: true },
+  BB_PERIOD:       { step: 1,   range: "10–40",  integer: true },
+  BB_STDEV:        { step: 0.1, range: "1.0–3.5" },
+};
 
 function renderStrategyParams(s) {
   const stat = s.static || {};
@@ -342,16 +456,65 @@ function renderStrategyParams(s) {
     const cur = ov[k];
     const overridden = cur !== undefined && cur !== null && cur !== def;
     const effective = overridden ? cur : def;
-    return `<dt>${k}</dt><dd>${effective}${overridden ? ` <span class="pill skip" style="margin-left:6px">override (default ${def})</span>` : ` <span class="muted small">(default)</span>`}</dd>`;
+    const meta = STRATEGY_META[k];
+    const tag = overridden
+      ? `<span class="pill skip" style="margin-left:6px" title="Click Save to keep, or Reset to revert">override</span>`
+      : `<span class="muted small" style="margin-left:6px">default</span>`;
+    return `
+      <dt>${k} <span class="muted small">${meta.range}</span></dt>
+      <dd>
+        <input type="number" id="ov-${k}" data-default="${def}"
+               step="${meta.step}" value="${effective}">
+        ${tag}
+        <span class="muted small" style="margin-left:6px">default ${def}</span>
+      </dd>`;
   }).join("");
   const hasOverrides = Object.keys(ov).length > 0;
   $("strategy-params").innerHTML = `
     <div class="kv small">${rows}</div>
-    <div class="row" style="margin-top:8px">
-      <button class="secondary" onclick="clearOverrides()" ${hasOverrides ? "" : "disabled"}>Clear Overrides</button>
-      <span class="muted small">${hasOverrides ? "Bot reads overrides every tick — change is immediate." : "No overrides — using config.py defaults."}</span>
+    <div class="row" style="margin-top:10px; gap:8px; flex-wrap:wrap">
+      <button onclick="saveStrategyOverrides()">Save Strategy</button>
+      <button class="secondary" onclick="resetStrategyInputs()">Reset Inputs</button>
+      <button class="secondary" onclick="clearOverrides()" ${hasOverrides ? "" : "disabled"}>Clear All Overrides</button>
+      <span class="muted small">${hasOverrides
+        ? "Bot reads overrides every tick — Save takes effect immediately."
+        : "No overrides — using config.py defaults."}</span>
     </div>
   `;
+}
+
+function resetStrategyInputs() {
+  // Restore inputs to whatever effective value the latest /api/state had.
+  if (LAST_STATE) renderStrategyParams(LAST_STATE);
+}
+
+async function saveStrategyOverrides() {
+  // Send every field. Backend treats value==default as "remove that override",
+  // so the user can revert one knob without touching the others.
+  const body = {};
+  for (const k of STRATEGY_KEYS) {
+    const el = $("ov-" + k);
+    if (!el) continue;
+    const raw = el.value;
+    if (raw === "" || raw === null) { body[k] = null; continue; }
+    const n = Number(raw);
+    if (Number.isNaN(n)) { toast(`${k}: not a number`, "err"); return; }
+    body[k] = STRATEGY_META[k].integer ? Math.round(n) : n;
+  }
+  try {
+    const r = await fetch("/api/strategy-overrides", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "save failed");
+    const n = Object.keys(j.changed || {}).length;
+    toast(n ? `Saved ${n} change(s)` : "No changes (all values match current state)");
+    refresh();
+  } catch (e) {
+    toast(String(e), "err");
+  }
 }
 
 async function clearOverrides() {
@@ -533,16 +696,23 @@ Chart.defaults.borderColor = CHART_GRID;
 Chart.defaults.font.family = "-apple-system, system-ui, 'Segoe UI', sans-serif";
 
 let _chartEquity = null, _chartPnl = null;
+let _chartConfidence = null, _chartTrigger = null, _chartExit = null;
 let _chartRangeDays = 7;
 
 async function loadCharts(days) {
   _chartRangeDays = days;
-  const [eqResp, pnlResp] = await Promise.all([
+  const [eqResp, pnlResp, confResp, trigResp, exitResp] = await Promise.all([
     fetch(`/api/equity-history?days=${days}`).then(r => r.json()),
     fetch(`/api/pnl-by-symbol?days=${days}`).then(r => r.json()),
+    fetch(`/api/ai-confidence-history?days=${days}`).then(r => r.json()),
+    fetch(`/api/pnl-by-trigger?days=${days}`).then(r => r.json()),
+    fetch(`/api/pnl-by-exit-reason?days=${days}`).then(r => r.json()),
   ]);
   renderEquityChart(eqResp);
   renderPnlChart(pnlResp);
+  renderConfidenceChart(confResp);
+  renderTriggerChart(trigResp);
+  renderExitChart(exitResp);
 }
 
 function renderEquityChart(resp) {
@@ -625,6 +795,141 @@ function renderPnlChart(resp) {
       },
     },
   });
+}
+
+function renderConfidenceChart(resp) {
+  const points = resp.points || [];
+  $("conf-meta").textContent = points.length
+    ? `· ${resp.returned_count}/${resp.raw_count} entries · last score ${points[points.length-1].sentiment_score}/10`
+    : "· no data yet";
+
+  const scoreData = points.map(p => ({ x: new Date(p.ts).getTime(), y: p.sentiment_score }));
+  const confData  = points.map(p => ({ x: new Date(p.ts).getTime(), y: p.sentiment_confidence }));
+  const gateData  = points
+    .filter(p => p.gate_go_ratio !== null && p.gate_go_ratio !== undefined)
+    .map(p => ({ x: new Date(p.ts).getTime(), y: p.gate_go_ratio }));
+
+  const ctx = document.getElementById("chart-confidence").getContext("2d");
+  if (_chartConfidence) _chartConfidence.destroy();
+  _chartConfidence = new Chart(ctx, {
+    data: {
+      datasets: [
+        {
+          type: "line",
+          label: "Sentiment Score (0-10)",
+          data: scoreData,
+          yAxisID: "y",
+          borderColor: "#58a6ff",
+          backgroundColor: "rgba(88,166,255,0.10)",
+          fill: false, tension: 0.25, pointRadius: 2, borderWidth: 2,
+        },
+        {
+          type: "line",
+          label: "Sentiment Confidence (0-1)",
+          data: confData,
+          yAxisID: "y1",
+          borderColor: "#d29922",
+          backgroundColor: "rgba(210,153,34,0.10)",
+          fill: false, tension: 0.25, pointRadius: 2, borderWidth: 2, borderDash: [4, 4],
+        },
+        {
+          type: "line",
+          label: "Gate GO Ratio (0-1)",
+          data: gateData,
+          yAxisID: "y1",
+          borderColor: "#3fb950",
+          backgroundColor: "rgba(63,185,80,0.10)",
+          fill: false, tension: 0, pointRadius: 3, pointStyle: "rectRot", borderWidth: 1.5,
+          showLine: false,
+        },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { intersect: false, mode: "index" },
+      plugins: {
+        legend: { display: true, position: "top", labels: { boxWidth: 12, padding: 10 } },
+        tooltip: {
+          callbacks: {
+            label: (c) => {
+              const v = c.parsed.y;
+              if (c.dataset.yAxisID === "y") return `Score: ${v}/10`;
+              return `${c.dataset.label.split(" (")[0]}: ${(v*100).toFixed(0)}%`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { type: "time", grid: { color: CHART_GRID },
+             time: { tooltipFormat: "yyyy-MM-dd HH:mm" } },
+        y:  { position: "left",  min: 0, max: 10, grid: { color: CHART_GRID },
+              title: { display: true, text: "Score (0-10)", color: "#58a6ff" } },
+        y1: { position: "right", min: 0, max: 1,  grid: { drawOnChartArea: false },
+              ticks: { callback: v => (v*100).toFixed(0)+"%" },
+              title: { display: true, text: "Confidence", color: "#d29922" } },
+      },
+    },
+  });
+}
+
+function renderBreakdownChart(canvasId, metaId, rows, totalPnl, totalTrades, kindLabel) {
+  $(metaId).textContent = rows.length
+    ? `· ${totalTrades} trades · total $${fmt(totalPnl, 2)}`
+    : "· no closed trades yet";
+  const labels = rows.map(r => r.key);
+  const values = rows.map(r => r.total_pnl_usd);
+  const colors = values.map(v => v >= 0 ? "rgba(63,185,80,0.7)" : "rgba(248,81,73,0.7)");
+  const borders = values.map(v => v >= 0 ? "#3fb950" : "#f85149");
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  return new Chart(ctx, {
+    type: "bar",
+    data: { labels, datasets: [{
+      label: `PnL by ${kindLabel} (USD)`,
+      data: values,
+      backgroundColor: colors,
+      borderColor: borders,
+      borderWidth: 1,
+    }]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (c) => {
+              const row = rows[c.dataIndex];
+              return [
+                `PnL: $${fmt(row.total_pnl_usd, 2)}`,
+                `Trades: ${row.trades} (${row.wins}W / ${row.losses}L)`,
+                `Win rate: ${(row.win_rate*100).toFixed(1)}%`,
+                `Avg PnL: $${fmt(row.avg_pnl_usd, 2)}`,
+              ];
+            },
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { maxRotation: 30, minRotation: 0 } },
+        y: { grid: { color: CHART_GRID }, ticks: { callback: v => "$" + v } },
+      },
+    },
+  });
+}
+
+function renderTriggerChart(resp) {
+  if (_chartTrigger) _chartTrigger.destroy();
+  _chartTrigger = renderBreakdownChart(
+    "chart-trigger", "trig-meta",
+    resp.by_trigger || [], resp.total_pnl_usd, resp.total_trades, "Trigger",
+  );
+}
+
+function renderExitChart(resp) {
+  if (_chartExit) _chartExit.destroy();
+  _chartExit = renderBreakdownChart(
+    "chart-exit", "exit-meta",
+    resp.by_exit_reason || [], resp.total_pnl_usd, resp.total_trades, "Exit Reason",
+  );
 }
 
 document.querySelectorAll("#range-seg button").forEach(btn => {

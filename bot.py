@@ -42,6 +42,10 @@ _last_equity_log_ts: float = 0.0
 # mark, which means a position already past +30% would re-arm from current ROE.
 _position_max_roe: dict[str, float] = {}
 
+# Last leverage value pushed to the exchange per symbol. Empty after a restart
+# so the first tick re-syncs whatever the dashboard config says, idempotently.
+_applied_leverage: dict[str, int] = {}
+
 # Per-symbol entry meta for matching ENTRY <-> EXIT in the journal. Reset on
 # bot restart, so any pre-existing position will EXIT-journal with trade_id=None
 # (the matching ENTRY simply lives in a previous run's journal file).
@@ -60,9 +64,10 @@ def load_env() -> tuple[str, str]:
     return pk, addr
 
 
-def handle_kill_switch(client: HyperliquidClient) -> None:
+def handle_kill_switch(client: HyperliquidClient,
+                       symbols: Optional[list[str]] = None) -> None:
     log.critical("Kill switch active: closing all open positions then halting.")
-    for symbol in config.SYMBOLS:
+    for symbol in (symbols or config.SYMBOLS):
         try:
             pos = client.get_open_position(symbol)
             if pos is not None:
@@ -191,38 +196,66 @@ def execute_signal(client: HyperliquidClient, symbol: str, signal: str,
             f"({'BUY' if is_buy else 'SELL'} {order_size:.4f}, ~${notional:.2f})"
         )
 
+    # client.market_open raises on:
+    #   - HTTP / SDK transport errors
+    #   - Hyperliquid inner rejections (szDecimals, min notional, leverage caps)
+    # so reaching the post-call code below means the exchange ACCEPTED the order
+    # and we have a real oid. Journal stays consistent with what actually
+    # executed — no more "ghost trades".
     try:
-        client.market_open(symbol, is_buy, notional)
+        result = client.market_open(symbol, is_buy, notional)
     except Exception as e:
-        log.error(f"[{symbol}] order submission failed: {e}")
+        log.error(f"[{symbol}] order submission failed, NOT journalling: {e}")
+        return
+
+    # Prefer exchange-reported fill data for the journal; fall back to our own
+    # rounded values when the response shape is unfamiliar.
+    rounded_sz = result.get("_rounded_sz") if isinstance(result, dict) else None
+    filled = result.get("_filled_status") if isinstance(result, dict) else None
+    actual_size_units: float = float(rounded_sz) if rounded_sz is not None else abs(target_size)
+    actual_fill_price: float = price
+    actual_oid: Optional[int] = None
+    if isinstance(filled, dict):
+        actual_oid = filled.get("oid")
+        try:
+            ts = filled.get("totalSz")
+            if ts is not None:
+                actual_size_units = float(ts)
+            ap = filled.get("avgPx")
+            if ap is not None:
+                actual_fill_price = float(ap)
+        except (TypeError, ValueError):
+            pass
+
+    if actual_size_units <= 0:
+        log.error(f"[{symbol}] post-fill size is {actual_size_units}, NOT journalling")
         return
 
     # Order accepted — record ENTRY in journal and capture meta for EXIT matching.
     trade_id = journal.new_trade_id()
     entry_side = "BUY" if is_buy else "SELL"
-    entry_size_units = abs(target_size)
-    entry_size_usd = entry_size_units * price
+    entry_size_usd = actual_size_units * actual_fill_price
     entry_ts = datetime.now(timezone.utc).isoformat()
     try:
         journal.log_entry(
             symbol=symbol,
             side=entry_side,
-            fill_price=price,
+            fill_price=actual_fill_price,
             size_usd=entry_size_usd,
-            size_units=entry_size_units,
+            size_units=actual_size_units,
             trade_id=trade_id,
-            decision_context=decision_context,
+            decision_context={**decision_context, "exchange_oid": actual_oid},
         )
     except Exception as e:
         log.warning(f"[{symbol}] ENTRY journal failed: {e}")
 
     _position_entry_meta[symbol] = {
         "trade_id": trade_id,
-        "entry_price": price,
+        "entry_price": actual_fill_price,
         "entry_ts": entry_ts,
         "side": entry_side,
         "size_usd": entry_size_usd,
-        "size_units": entry_size_units,
+        "size_units": actual_size_units,
     }
     # Fresh position -> reset the trailing-stop high-water mark.
     _position_max_roe.pop(symbol, None)
@@ -275,11 +308,12 @@ def _gather_symbol_state(client: HyperliquidClient, symbol: str) -> dict:
     return state
 
 
-def _gather_basket_ctx(client: HyperliquidClient, kill: KillSwitch) -> Optional[dict]:
+def _gather_basket_ctx(client: HyperliquidClient, kill: KillSwitch,
+                        symbols: list[str]) -> Optional[dict]:
     """Aggregate per-symbol state + account-level PnL into the multi-symbol ctx
     expected by ai_analyst's prompt builder."""
     try:
-        per_symbol = [_gather_symbol_state(client, s) for s in config.SYMBOLS]
+        per_symbol = [_gather_symbol_state(client, s) for s in symbols]
         ctx: dict[str, Any] = {"symbols": per_symbol}
         if kill.anchor_equity:
             try:
@@ -294,14 +328,15 @@ def _gather_basket_ctx(client: HyperliquidClient, kill: KillSwitch) -> Optional[
         return None
 
 
-def maybe_run_ai(last_ai_run: float, client: HyperliquidClient, kill: KillSwitch) -> float:
+def maybe_run_ai(last_ai_run: float, client: HyperliquidClient, kill: KillSwitch,
+                 symbols: list[str]) -> float:
     now = time.time()
     if now - last_ai_run < config.AI_REFRESH_SECONDS:
         return last_ai_run
-    log.info(f"Running AI analyst (refresh interval: {config.AI_REFRESH_SECONDS}s)")
+    log.info(f"Running AI analyst on {symbols} (refresh interval: {config.AI_REFRESH_SECONDS}s)")
     try:
-        ctx = _gather_basket_ctx(client, kill)
-        ai_analyst.run_once(market_ctx=ctx, client=client)
+        ctx = _gather_basket_ctx(client, kill, symbols)
+        ai_analyst.run_once(market_ctx=ctx, client=client, symbols=symbols)
     except Exception as e:
         log.error(f"AI analyst failed: {e}", exc_info=True)
     return now
@@ -366,7 +401,10 @@ def _build_decision_context(
             # captured verbatim for later attribution.
             **(info.get("params_used") or {}),
             "TRAILING_TIERS": config.TRAILING_TIERS,
-            "BASE_TRADE_SIZE_USD": config.BASE_TRADE_SIZE_USD.get(symbol),
+            # Per-symbol effective sizing & leverage at the moment of entry,
+            # so the journal reflects whatever was active on the dashboard.
+            "BASE_TRADE_SIZE_USD": _resolve_symbol_config(current_settings, symbol)[0],
+            "LEVERAGE": _resolve_symbol_config(current_settings, symbol)[1],
         },
     }
 
@@ -454,7 +492,7 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
     )
 
     multiplier = float(current_settings.get("TRADE_SIZE_MULTIPLIER", 1.0))
-    base_size = float(config.BASE_TRADE_SIZE_USD.get(symbol, 0.0))
+    base_size, _leverage = _resolve_symbol_config(current_settings, symbol)
     trade_size = base_size * multiplier
     if trade_size < 1.0:
         log.warning(f"[{symbol}] trade size ${trade_size:.2f} below $1 — skipping.")
@@ -503,6 +541,129 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
     execute_signal(client, symbol, signal, trade_size, decision_context)
 
 
+def _active_symbols(current_settings: dict[str, Any]) -> list[str]:
+    """The list the bot iterates THIS tick — dashboard-editable, falls back to
+    config.SYMBOLS so an empty/missing field never silently disables trading."""
+    syms = current_settings.get("symbols")
+    if isinstance(syms, list) and syms:
+        return [str(s).upper() for s in syms]
+    return list(config.SYMBOLS)
+
+
+def _ensure_symbol_configs(current_settings: dict[str, Any],
+                            symbols: list[str]) -> bool:
+    """Make sure every symbol the bot is about to trade has a symbol_configs
+    entry. Brand-new symbols (e.g. user just typed "BTC" on the dashboard) get
+    seeded with config.NEW_SYMBOL_DEFAULT_* values so we never crash on a
+    KeyError mid-tick.
+
+    Mutates `current_settings["symbol_configs"]` in place. Returns True if a
+    seed happened so the caller can persist the update.
+    """
+    sc = current_settings.setdefault("symbol_configs", {})
+    changed = False
+    for sym in symbols:
+        if sym in sc:
+            continue
+        sc[sym] = {
+            "base_usd": float(config.NEW_SYMBOL_DEFAULT_BASE_USD),
+            "leverage": int(config.NEW_SYMBOL_DEFAULT_LEVERAGE),
+        }
+        changed = True
+        log.info(
+            f"Auto-seeded symbol_configs[{sym}] = "
+            f"base_usd=${config.NEW_SYMBOL_DEFAULT_BASE_USD} "
+            f"leverage={config.NEW_SYMBOL_DEFAULT_LEVERAGE}x"
+        )
+    return changed
+
+
+def _process_force_close_queue(client: HyperliquidClient,
+                                current_settings: dict[str, Any]) -> bool:
+    """Drain config.json -> force_close_queue at the top of each tick.
+
+    For every queued symbol with a live position: journal an EXIT with
+    reason "manual_close" THEN issue market_close (so the journal record can't
+    miss the position state). Then write back an empty queue so the action
+    isn't repeated. Returns True if any work happened.
+    """
+    queue = current_settings.get("force_close_queue") or []
+    if not isinstance(queue, list) or not queue:
+        return False
+
+    log.warning(f"Manual close requested via dashboard: {queue}")
+    for symbol in list(queue):
+        symbol = str(symbol).upper()
+        try:
+            pos = client.get_open_position(symbol)
+        except Exception as e:
+            log.error(f"[{symbol}] manual close: position fetch failed: {e}")
+            pos = None
+
+        if pos is None:
+            log.warning(f"[{symbol}] manual close requested but no live position; skipping")
+        else:
+            roe = _compute_roe_pct(pos) or 0.0
+            max_roe = _position_max_roe.get(symbol, roe)
+            try:
+                _journal_exit_before_close(client, symbol, pos, "manual_close", max_roe, roe)
+            except Exception as e:
+                log.warning(f"[{symbol}] manual close journal failed: {e}")
+            try:
+                client.market_close(symbol)
+                log.info(f"[{symbol}] manual close executed")
+            except Exception as e:
+                log.error(f"[{symbol}] manual close failed: {e}")
+            _position_max_roe.pop(symbol, None)
+
+    # Re-load before write-back so we don't clobber any close requests the
+    # dashboard added DURING our market_close round trip. Only remove the
+    # symbols we actually processed in this drain.
+    processed = {str(s).upper() for s in queue}
+    cfg = settings.load()
+    remaining = [s for s in (cfg.get("force_close_queue") or [])
+                 if str(s).upper() not in processed]
+    cfg["force_close_queue"] = remaining
+    settings.save(cfg)
+    return True
+
+
+def _resolve_symbol_config(current_settings: dict[str, Any], symbol: str
+                           ) -> tuple[float, int]:
+    """Effective (base_usd, leverage) for `symbol`. Falls back to config.py
+    constants when config.json doesn't have an entry."""
+    sc = (current_settings.get("symbol_configs") or {}).get(symbol) or {}
+    try:
+        base = float(sc.get("base_usd", config.BASE_TRADE_SIZE_USD.get(symbol, 0.0)))
+    except (TypeError, ValueError):
+        base = float(config.BASE_TRADE_SIZE_USD.get(symbol, 0.0))
+    try:
+        lev = int(sc.get("leverage", config.DEFAULT_LEVERAGE))
+    except (TypeError, ValueError):
+        lev = int(config.DEFAULT_LEVERAGE)
+    return base, lev
+
+
+def _sync_leverage(client: HyperliquidClient, current_settings: dict[str, Any],
+                   symbols: list[str]) -> None:
+    """Push any leverage drift from config.json to Hyperliquid.
+
+    Cheap on cache hit (just a dict lookup). On cache miss / change, makes one
+    `update_leverage` API call per affected symbol. Failures don't crash the
+    tick — they're logged and we leave the cache stale so the next tick
+    retries.
+    """
+    for symbol in symbols:
+        _, desired = _resolve_symbol_config(current_settings, symbol)
+        if _applied_leverage.get(symbol) == desired:
+            continue
+        try:
+            client.update_leverage(symbol, desired, config.DEFAULT_LEVERAGE_IS_CROSS)
+            _applied_leverage[symbol] = desired
+        except Exception as e:
+            log.error(f"[{symbol}] update_leverage to {desired}x failed: {e}")
+
+
 def _maybe_log_equity(equity: float, kill: KillSwitch) -> None:
     """Sample equity to journal/equity-*.jsonl every EQUITY_LOG_INTERVAL_SECONDS.
     Used by the dashboard's equity curve chart."""
@@ -521,16 +682,33 @@ def _maybe_log_equity(equity: float, kill: KillSwitch) -> None:
 
 
 def tick(client: HyperliquidClient, kill: KillSwitch, current_settings: dict[str, Any]) -> None:
+    symbols = _active_symbols(current_settings)
+
+    # 1. Auto-seed any newly-added symbols with safe defaults so the rest of
+    #    the tick (sizing, leverage push, gate ctx) doesn't trip on KeyErrors.
+    if _ensure_symbol_configs(current_settings, symbols):
+        cfg = settings.load()
+        cfg.setdefault("symbol_configs", {}).update(current_settings["symbol_configs"])
+        settings.save(cfg)
+
+    # 2. Drain dashboard-issued manual close requests BEFORE leverage sync /
+    #    new-order logic — operator intent always wins.
+    _process_force_close_queue(client, current_settings)
+
+    # 3. Push any leverage edits from the dashboard to Hyperliquid. No-op when
+    #    nothing changed.
+    _sync_leverage(client, current_settings, symbols)
+
     real_equity = client.get_account_equity()
     kill.set_anchor(real_equity, current_settings)
     equity = kill.observe(real_equity)
     _maybe_log_equity(equity, kill)
     if kill.check(equity, current_settings):
-        handle_kill_switch(client)
+        handle_kill_switch(client, symbols)
         return
 
     ai_meta = current_settings.get("ai_meta") or {}
-    for symbol in config.SYMBOLS:
+    for symbol in symbols:
         _process_symbol(client, kill, symbol, current_settings, ai_meta)
 
 
@@ -544,12 +722,16 @@ def main() -> None:
         log.info(f"Journal purge: removed {purged} file(s) older than {journal.RETENTION_MONTHS} months")
 
     boot = settings.load()
+    boot_symbols = _active_symbols(boot)
+    if _ensure_symbol_configs(boot, boot_symbols):
+        settings.save(boot)
     sizes = ", ".join(
-        f"{s}=${config.BASE_TRADE_SIZE_USD[s] * boot['TRADE_SIZE_MULTIPLIER']:.0f}"
-        for s in config.SYMBOLS
+        f"{s}=${_resolve_symbol_config(boot, s)[0] * boot['TRADE_SIZE_MULTIPLIER']:.0f}"
+        f"@{_resolve_symbol_config(boot, s)[1]}x"
+        for s in boot_symbols
     )
     log.info(
-        f"Bot starting | symbols={config.SYMBOLS} loop={config.LOOP_SECONDS}s "
+        f"Bot starting | symbols={boot_symbols} loop={config.LOOP_SECONDS}s "
         f"sizes=({sizes}) mult={boot['TRADE_SIZE_MULTIPLIER']} "
         f"loss_limit={boot['DAILY_LOSS_LIMIT'] * 100:.2f}% "
         f"rsi=({config.RSI_OVERSOLD}/{config.RSI_OVERBOUGHT}, locked) "
@@ -561,7 +743,11 @@ def main() -> None:
     while True:
         start = time.time()
         try:
-            last_ai_run = maybe_run_ai(last_ai_run, client, kill)
+            # AI cycle may overwrite config.json (suggestions / live tune), so
+            # we re-load AFTER it returns to use the freshest values for tick.
+            pre_settings = settings.load()
+            last_ai_run = maybe_run_ai(last_ai_run, client, kill,
+                                       _active_symbols(pre_settings))
             current_settings = settings.load()
             ai_meta = current_settings.get("ai_meta") or {}
             if ai_meta.get("last_sentiment") is not None:

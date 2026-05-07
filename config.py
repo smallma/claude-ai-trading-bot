@@ -8,12 +8,25 @@ Per-symbol BASE size is static; AI scales it with TRADE_SIZE_MULTIPLIER (typ. 0.
 
 SYMBOLS = ["SOL", "ETH", "ADA"]
 
-# Per-symbol base trade size in USD. Actual order size = BASE * TRADE_SIZE_MULTIPLIER.
+# Per-symbol base trade size — fallback only. The runtime value is read from
+# config.json -> symbol_configs[symbol].base_usd, which the dashboard edits.
 BASE_TRADE_SIZE_USD = {
     "SOL": 40.0,
     "ETH": 40.0,
     "ADA": 20.0,
 }
+
+# Per-symbol leverage default — fallback only. Runtime value lives in
+# config.json -> symbol_configs[symbol].leverage. Bot pushes the value to
+# Hyperliquid via exchange.update_leverage() whenever it changes.
+DEFAULT_LEVERAGE = 1
+DEFAULT_LEVERAGE_IS_CROSS = True
+
+# When the dashboard adds a brand-new symbol that has no symbol_configs entry,
+# the bot auto-seeds one with these values so it doesn't crash on the next tick.
+# Keep base_usd modest — the user can tune up after observing market behaviour.
+NEW_SYMBOL_DEFAULT_BASE_USD = 20.0
+NEW_SYMBOL_DEFAULT_LEVERAGE = 20
 
 # Max simultaneous open positions PER SYMBOL (each symbol tracked independently).
 MAX_OPEN_POSITIONS_PER_SYMBOL = 1
