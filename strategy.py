@@ -69,11 +69,29 @@ def _bb_position(close: float, lower: float, upper: float) -> str:
     return "inside"
 
 
+def _ov(settings: dict[str, Any], key: str, default: Any) -> Any:
+    """Read from settings['strategy_overrides'][key] if present, else config default.
+
+    Lets strategy_reviewer.py tune RSI/EMA/BB parameters via config.json without
+    touching config.py. Bot picks the new value up on the next tick.
+    """
+    overrides = (settings or {}).get("strategy_overrides") or {}
+    val = overrides.get(key)
+    return val if val is not None else default
+
+
 def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]:
+    rsi_oversold_thr = float(_ov(settings, "RSI_OVERSOLD", config.RSI_OVERSOLD))
+    rsi_overbought_thr = float(_ov(settings, "RSI_OVERBOUGHT", config.RSI_OVERBOUGHT))
+    ema_fast_period = int(_ov(settings, "EMA_FAST_PERIOD", config.EMA_FAST_PERIOD))
+    ema_slow_period = int(_ov(settings, "EMA_SLOW_PERIOD", config.EMA_SLOW_PERIOD))
+    bb_period = int(_ov(settings, "BB_PERIOD", config.BB_PERIOD))
+    bb_stdev = float(_ov(settings, "BB_STDEV", config.BB_STDEV))
+
     rsi = _rsi(closes, config.RSI_PERIOD)
-    ema_fast = _ema(closes, config.EMA_FAST_PERIOD)
-    ema_slow = _ema(closes, config.EMA_SLOW_PERIOD)
-    bb_upper, bb_mid, bb_lower = _bbands(closes, config.BB_PERIOD, config.BB_STDEV)
+    ema_fast = _ema(closes, ema_fast_period)
+    ema_slow = _ema(closes, ema_slow_period)
+    bb_upper, bb_mid, bb_lower = _bbands(closes, bb_period, bb_stdev)
     last_close = closes[-1]
 
     ema_trend = "BULL" if ema_fast > ema_slow else "BEAR"
@@ -89,11 +107,19 @@ def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]
         "bb_lower": round(bb_lower, 4),
         "bb_position": bb_pos,
         "last_close": last_close,
-        "thresholds": (config.RSI_OVERSOLD, config.RSI_OVERBOUGHT),
+        "thresholds": (rsi_oversold_thr, rsi_overbought_thr),
+        "params_used": {
+            "RSI_OVERSOLD": rsi_oversold_thr,
+            "RSI_OVERBOUGHT": rsi_overbought_thr,
+            "EMA_FAST_PERIOD": ema_fast_period,
+            "EMA_SLOW_PERIOD": ema_slow_period,
+            "BB_PERIOD": bb_period,
+            "BB_STDEV": bb_stdev,
+        },
     }
 
-    rsi_oversold = rsi < config.RSI_OVERSOLD
-    rsi_overbought = rsi > config.RSI_OVERBOUGHT
+    rsi_oversold = rsi < rsi_oversold_thr
+    rsi_overbought = rsi > rsi_overbought_thr
     bb_break_low = last_close < bb_lower
     bb_break_high = last_close > bb_upper
 

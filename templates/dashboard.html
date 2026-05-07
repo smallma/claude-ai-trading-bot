@@ -102,6 +102,12 @@
     <hr style="border:0; border-top:1px solid var(--border); margin:14px 0">
     <h2 style="margin-top:0">AI Capital Suggestion</h2>
     <div id="suggestion"></div>
+    <hr style="border:0; border-top:1px solid var(--border); margin:14px 0">
+    <h2 style="margin-top:0">Strategy Params (effective)</h2>
+    <div id="strategy-params"></div>
+    <hr style="border:0; border-top:1px solid var(--border); margin:14px 0">
+    <h2 style="margin-top:0">Daily Strategy Review</h2>
+    <div id="strategy-review"></div>
   </section>
 
   <section class="panel" style="grid-column: 1 / -1">
@@ -145,6 +151,8 @@ async function refresh() {
     renderPositions(s);
     renderConfig(s);
     renderSuggestion(s);
+    renderStrategyParams(s);
+    renderStrategyReview(s);
     renderTrades(s.trades || []);
     $("last-refresh").textContent = "refreshed " + fmtTs(s.now);
     $("env-badge").textContent = s.static.USE_TESTNET ? "TESTNET" : "MAINNET";
@@ -283,6 +291,92 @@ async function applySuggestion() {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || "apply failed");
     toast(`Applied: mult=${j.applied.TRADE_SIZE_MULTIPLIER} loss=${j.applied.DAILY_LOSS_LIMIT}`);
+    refresh();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+const STRATEGY_KEYS = ["RSI_OVERSOLD","RSI_OVERBOUGHT","EMA_FAST_PERIOD","EMA_SLOW_PERIOD","BB_PERIOD","BB_STDEV"];
+
+function renderStrategyParams(s) {
+  const stat = s.static || {};
+  const ov = (s.config && s.config.strategy_overrides) || {};
+  const rows = STRATEGY_KEYS.map(k => {
+    const def = stat[k];
+    const cur = ov[k];
+    const overridden = cur !== undefined && cur !== null && cur !== def;
+    const effective = overridden ? cur : def;
+    return `<dt>${k}</dt><dd>${effective}${overridden ? ` <span class="pill skip" style="margin-left:6px">override (default ${def})</span>` : ` <span class="muted small">(default)</span>`}</dd>`;
+  }).join("");
+  const hasOverrides = Object.keys(ov).length > 0;
+  $("strategy-params").innerHTML = `
+    <div class="kv small">${rows}</div>
+    <div class="row" style="margin-top:8px">
+      <button class="secondary" onclick="clearOverrides()" ${hasOverrides ? "" : "disabled"}>Clear Overrides</button>
+      <span class="muted small">${hasOverrides ? "Bot reads overrides every tick — change is immediate." : "No overrides — using config.py defaults."}</span>
+    </div>
+  `;
+}
+
+async function clearOverrides() {
+  if (!confirm("Clear ALL strategy overrides and revert to config.py defaults?")) return;
+  try {
+    const r = await fetch("/api/clear-strategy-overrides", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "clear failed");
+    toast(`Cleared ${Object.keys(j.cleared).length} override(s)`);
+    refresh();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+function renderStrategyReview(s) {
+  const meta = (s.config && s.config.ai_meta) || {};
+  const sugg = meta.suggested_strategy;
+  const div = $("strategy-review");
+  if (!sugg) {
+    div.innerHTML = `<span class="muted small">No review yet — run <code>strategy_reviewer.py</code> (cron daily).</span>`;
+    return;
+  }
+  const overrides = sugg.suggested_overrides || {};
+  const rationale = sugg.rationale_per_change || {};
+  const live = (s.config && s.config.strategy_overrides) || {};
+  const allMatch = Object.entries(overrides).every(([k,v]) => Number(live[k]) === Number(v));
+  const status = sugg.applied ? `<span class="ok small">APPLIED</span>` :
+                 (Object.keys(overrides).length === 0) ? `<span class="muted small">no changes proposed</span>` :
+                 allMatch ? `<span class="muted small">matches live overrides</span>` :
+                            `<span class="pill skip">PENDING</span>`;
+  const overrideRows = Object.entries(overrides).map(([k,v]) => {
+    const reason = rationale[k] || "";
+    const liveVal = live[k];
+    return `<dt>${k}</dt><dd>${v}${liveVal !== undefined ? ` <span class="muted small">(live: ${liveVal})</span>` : ""}<div class="muted small" style="margin-top:2px">${escapeHtml(reason)}</div></dd>`;
+  }).join("") || `<dt class="muted">none</dt><dd class="muted">reviewer suggested no changes</dd>`;
+  const notes = (sugg.validation_notes || []).map(n => `<li>${escapeHtml(n)}</li>`).join("");
+  div.innerHTML = `
+    <div class="sugg-box">
+      <div class="row" style="justify-content:space-between">
+        <strong>Confidence ${fmt(sugg.confidence ?? 0,2)} · ${sugg.stats_summary?.closed_trades ?? "?"} trades / ${sugg.stats_summary?.lookback_days ?? "?"}d</strong>
+        ${status}
+      </div>
+      <div class="muted small" style="margin:6px 0">${escapeHtml(sugg.diagnosis || "")}</div>
+      <div class="kv small">${overrideRows}</div>
+      ${notes ? `<details style="margin-top:8px"><summary class="muted small">validation notes (${sugg.validation_notes.length})</summary><ul class="small">${notes}</ul></details>` : ""}
+      <div class="row" style="margin-top:8px">
+        <button class="warn" onclick="applyStrategySuggestion()" ${sugg.applied || allMatch || Object.keys(overrides).length === 0 ? "disabled" : ""}>Apply Strategy Overrides</button>
+        <span class="muted small">computed ${fmtTs(sugg.computed_at)}</span>
+      </div>
+    </div>`;
+}
+
+async function applyStrategySuggestion() {
+  if (!confirm("Apply AI's strategy parameter overrides? Bot will use them on the next tick.")) return;
+  try {
+    const r = await fetch("/api/apply-strategy-suggestion", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "apply failed");
+    toast(`Applied ${Object.keys(j.applied).length} override(s)`);
     refresh();
   } catch (e) {
     toast(String(e), "err");

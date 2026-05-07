@@ -23,6 +23,10 @@ DEFAULTS: dict[str, Any] = {
     # AI confirmation gate before placing orders. False = pure RSI/EMA/BB
     # signals execute directly; True = both Gemini + MiniMax must vote GO.
     "TRADE_GATE_ENABLED": True,
+    # Per-key overrides written by strategy_reviewer.py. Keys mirror config.py
+    # constant names (RSI_OVERSOLD, RSI_OVERBOUGHT, EMA_FAST_PERIOD,
+    # EMA_SLOW_PERIOD, BB_PERIOD, BB_STDEV). Empty by default = use config.py.
+    "strategy_overrides": {},
     "ai_meta": {
         "last_sentiment": None,
         "last_updated": None,

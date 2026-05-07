@@ -142,6 +142,10 @@ def api_state():
             "BASE_TRADE_SIZE_USD": config.BASE_TRADE_SIZE_USD,
             "RSI_OVERSOLD": config.RSI_OVERSOLD,
             "RSI_OVERBOUGHT": config.RSI_OVERBOUGHT,
+            "EMA_FAST_PERIOD": config.EMA_FAST_PERIOD,
+            "EMA_SLOW_PERIOD": config.EMA_SLOW_PERIOD,
+            "BB_PERIOD": config.BB_PERIOD,
+            "BB_STDEV": config.BB_STDEV,
             "AI_REFRESH_SECONDS": config.AI_REFRESH_SECONDS,
             "USE_TESTNET": config.USE_TESTNET,
         },
@@ -188,6 +192,47 @@ def api_set_config():
 
     log.info(f"config update via dashboard: {changed}")
     return jsonify({"ok": True, "changed": changed})
+
+
+@app.route("/api/apply-strategy-suggestion", methods=["POST"])
+def api_apply_strategy_suggestion():
+    """Promote ai_meta.suggested_strategy.suggested_overrides -> live strategy_overrides.
+
+    Used when AUTO_STRATEGY_EVOLVE=False — strategy_reviewer.py stages the
+    suggestion, the operator clicks Apply on the dashboard.
+    """
+    with _save_lock:
+        cfg = settings.load()
+        meta = cfg.get("ai_meta") or {}
+        sugg = meta.get("suggested_strategy")
+        if not sugg:
+            return jsonify({"ok": False, "error": "no strategy suggestion staged"}), 404
+        overrides = sugg.get("suggested_overrides") or {}
+        if not overrides:
+            return jsonify({"ok": False, "error": "suggestion has no overrides to apply"}), 400
+
+        merged = {**(cfg.get("strategy_overrides") or {}), **overrides}
+        cfg["strategy_overrides"] = merged
+        sugg["applied"] = True
+        sugg["applied_at"] = datetime.now(timezone.utc).isoformat()
+        meta["suggested_strategy"] = sugg
+        cfg["ai_meta"] = meta
+        settings.save(cfg)
+
+    log.info(f"strategy suggestion applied: {overrides}")
+    return jsonify({"ok": True, "applied": overrides})
+
+
+@app.route("/api/clear-strategy-overrides", methods=["POST"])
+def api_clear_strategy_overrides():
+    """Wipe strategy_overrides, reverting to config.py defaults."""
+    with _save_lock:
+        cfg = settings.load()
+        prev = cfg.get("strategy_overrides") or {}
+        cfg["strategy_overrides"] = {}
+        settings.save(cfg)
+    log.info(f"strategy_overrides cleared (was: {prev})")
+    return jsonify({"ok": True, "cleared": prev})
 
 
 @app.route("/api/apply-suggestion", methods=["POST"])

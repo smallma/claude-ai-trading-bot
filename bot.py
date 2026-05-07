@@ -352,12 +352,10 @@ def _build_decision_context(
         "config_snapshot": {
             "TRADE_SIZE_MULTIPLIER": current_settings.get("TRADE_SIZE_MULTIPLIER"),
             "DAILY_LOSS_LIMIT": current_settings.get("DAILY_LOSS_LIMIT"),
-            "RSI_OVERSOLD": config.RSI_OVERSOLD,
-            "RSI_OVERBOUGHT": config.RSI_OVERBOUGHT,
-            "EMA_FAST_PERIOD": config.EMA_FAST_PERIOD,
-            "EMA_SLOW_PERIOD": config.EMA_SLOW_PERIOD,
-            "BB_PERIOD": config.BB_PERIOD,
-            "BB_STDEV": config.BB_STDEV,
+            # Effective strategy params for THIS trade — pulled from strategy
+            # output rather than raw config.py so reviewer overrides are
+            # captured verbatim for later attribution.
+            **(info.get("params_used") or {}),
             "TRAILING_TIERS": config.TRAILING_TIERS,
             "BASE_TRADE_SIZE_USD": config.BASE_TRADE_SIZE_USD.get(symbol),
         },

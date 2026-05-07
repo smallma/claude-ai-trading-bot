@@ -57,6 +57,9 @@ AI_REFRESH_SECONDS = 900
 
 # Models
 GEMINI_MODEL = "gemini-2.5-flash"
+# Higher-tier model used by strategy_reviewer.py — runs daily, low call count,
+# worth the upgrade for parameter-tuning recommendations.
+GEMINI_REVIEWER_MODEL = "gemini-2.5-pro"
 MINIMAX_MODEL = "MiniMax-M2.7"
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
