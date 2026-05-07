@@ -119,24 +119,33 @@ class HyperliquidClient:
     def get_account_equity(self) -> float:
         """Total Net Equity used by the kill switch and dashboard equity curve.
 
-        Uses crossMarginSummary.accountValue which already includes:
-            totalMarginUsed + withdrawable + unrealised PnL
-
-        This matches Hyperliquid's "Total Equity" on the Portfolio page.
-        Do NOT add spot USDC on top — in cross-margin mode the same USDC
-        appears in both perp and spot API responses, causing double-count.
+        Hyperliquid's Unified Margin puts the true 'Total Equity' for USDC inside
+        spot_user_state -> balances -> USDC -> total. This value ALREADY includes
+        the perp's crossMarginSummary.accountValue (used margin + unrealised PnL).
+        We simply extract this spot total to match the Web UI's 'Total Equity'.
         """
-        perp_state = self.info.user_state(self.address)
-        cms = perp_state.get("crossMarginSummary") or perp_state.get("marginSummary") or {}
+        total = 0.0
         try:
-            total = float(cms.get("accountValue") or 0.0)
-        except (TypeError, ValueError):
-            total = 0.0
+            spot_state = self.info.spot_user_state(self.address)
+            for b in (spot_state or {}).get("balances", []):
+                if b.get("coin") == "USDC":
+                    total = float(b.get("total") or 0.0)
+                    break
+        except Exception as e:
+            log.warning(f"Spot state fetch failed, falling back to perp value: {e}")
 
-        log.info(
-            f"[equity] total=${total:.4f} "
-            f"(used={cms.get('totalMarginUsed')}, withdrawable={perp_state.get('withdrawable')})"
-        )
+        # Fallback for accounts/testnets where spot state might be completely empty
+        if total == 0.0:
+            perp_state = self.info.user_state(self.address)
+            cms = perp_state.get("crossMarginSummary") or perp_state.get("marginSummary") or {}
+            try:
+                total = float(cms.get("accountValue") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            log.info(f"[equity] using perp fallback accountValue: ${total:.4f}")
+        else:
+            log.info(f"[equity] total=${total:.4f} (from spot USDC unified balance)")
+
         return total
 
     def get_open_position(self, symbol: str) -> Optional[dict]:
