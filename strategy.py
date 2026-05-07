@@ -94,7 +94,16 @@ def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]
     bb_upper, bb_mid, bb_lower = _bbands(closes, bb_period, bb_stdev)
     last_close = closes[-1]
 
-    ema_trend = "BULL" if ema_fast > ema_slow else "BEAR"
+    # EMA spread threshold: require >0.15% gap to declare a trend.
+    # If fast/slow are too close ("glued"), force FLAT to avoid false breakouts.
+    ema_spread = abs(ema_fast - ema_slow) / ema_slow if ema_slow != 0 else 0.0
+    EMA_SPREAD_THRESHOLD = 0.0015  # 0.15%
+    if ema_spread < EMA_SPREAD_THRESHOLD:
+        ema_trend = "FLAT"
+    elif ema_fast > ema_slow:
+        ema_trend = "BULL"
+    else:
+        ema_trend = "BEAR"
     bb_pos = _bb_position(last_close, bb_lower, bb_upper)
 
     info = {
@@ -102,6 +111,7 @@ def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]
         "ema_fast": round(ema_fast, 4),
         "ema_slow": round(ema_slow, 4),
         "ema_trend": ema_trend,
+        "ema_spread_pct": round(ema_spread * 100, 4),
         "bb_upper": round(bb_upper, 4),
         "bb_mid": round(bb_mid, 4),
         "bb_lower": round(bb_lower, 4),
@@ -123,10 +133,26 @@ def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]
     bb_break_low = last_close < bb_lower
     bb_break_high = last_close > bb_upper
 
-    if ema_trend == "BULL" and (rsi_oversold or bb_break_low):
-        info["trigger"] = "RSI oversold" if rsi_oversold else "BB lower break"
-        return "BUY", info
-    if ema_trend == "BEAR" and (rsi_overbought or bb_break_high):
-        info["trigger"] = "RSI overbought" if rsi_overbought else "BB upper break"
-        return "SELL", info
+    # EMA FLAT = consolidation -> no entries
+    if ema_trend == "FLAT":
+        return "HOLD", info
+
+    if ema_trend == "BULL":
+        if rsi_oversold:
+            info["trigger"] = "RSI oversold"
+            return "BUY", info
+        # BB lower break requires RSI dual confirmation (prevent catching knives)
+        if bb_break_low and rsi_oversold:
+            info["trigger"] = "BB lower break + RSI confirm"
+            return "BUY", info
+
+    if ema_trend == "BEAR":
+        if rsi_overbought:
+            info["trigger"] = "RSI overbought"
+            return "SELL", info
+        # BB upper break requires RSI dual confirmation
+        if bb_break_high and rsi_overbought:
+            info["trigger"] = "BB upper break + RSI confirm"
+            return "SELL", info
+
     return "HOLD", info

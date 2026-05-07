@@ -265,6 +265,17 @@ def _build_judge_prompt(round1_results: list[tuple[str, dict]], headlines: list[
 against fresh macro/on-chain data, producing ONE shared parameter decision for a
 multi-symbol perp bot trading the basket [{symbols_str}].
 
+=== CRITICAL RULES (highest priority — override all other heuristics) ===
+1. You MUST evaluate the provided Sentiment Score and Reason. If the sentiment
+   indicates bearish conditions OR warns of rising BTC dominance (>60% or
+   climbing), you MUST apply a HEAVY penalty to any BUY signals. Do NOT
+   blindly follow the EMA trend if the macro sentiment is explicitly negative.
+2. Conversely, if sentiment is highly bullish (score >= 8), restrict SELL signals
+   — require stronger technical confirmation before scoring bearishly.
+3. When Fear & Greed is below 25 (Extreme Fear), presume continued downside
+   unless strong reversal evidence exists. When above 75 (Extreme Greed),
+   presume overextension and penalize aggressive longs.
+
 === Initial analyst opinion (Round 1) ===
 {r1_summary}
 
@@ -284,8 +295,7 @@ multi-symbol perp bot trading the basket [{symbols_str}].
 Re-examine the analyst view against the fresh data. The basket includes alts
 (SOL, ADA), so penalize bullishness when BTC dominance is climbing. Penalize
 bullishness if multiple symbols show crowded-long funding. Reward bearishness
-if multiple symbols are
-already RSI-stretched in the opposite direction of the news.
+if multiple symbols are already RSI-stretched in the opposite direction of the news.
 
 Be more decisive than the initial analyst alone (use supplementary data to
 sharpen the call). Stay within the same output schema.
