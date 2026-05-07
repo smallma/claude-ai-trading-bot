@@ -20,7 +20,7 @@ DEFAULTS: dict[str, Any] = {
     # Approval gates — when False, AI/reviewer write SUGGESTIONS into ai_meta
     # and wait for the dashboard operator to apply them. When True, changes
     # take effect automatically.
-    "AUTO_CAPITAL_TUNE": False,
+    "AUTO_CAPITAL_TUNE": True,
     "AUTO_STRATEGY_EVOLVE": False,
     # AI confirmation gate before placing orders. False = pure RSI/EMA/BB
     # signals execute directly; True = both Gemini + MiniMax must vote GO.
@@ -39,6 +39,9 @@ DEFAULTS: dict[str, Any] = {
         }
         for sym in config.SYMBOLS
     },
+    # Editable prompt templates for AI
+    "AI_ROUND1_PROMPT": "You are a crypto market sentiment analyst tuning SHARED parameters\nfor an automated perpetual futures bot trading a basket of {symbols_str}.\nYour scoring should reflect the broad crypto regime (it applies to all symbols).\n\nRecent crypto headlines (last hour, multi-source):\n{bullets}\n\nFear & Greed Index: {fng_block}\n\nCurrent per-symbol market state:\n{market_ctx_str}\n\nOutput strictly three lines:\nSCORE: <integer 1-10>\nCONFIDENCE: <decimal 0.0-1.0>\nREASON: <one short sentence>",
+    "AI_JUDGE_PROMPT": "You are the FINAL JUDGE re-evaluating an initial analyst opinion\nagainst fresh macro/on-chain data, producing ONE shared parameter decision for a\nmulti-symbol perp bot trading the basket [{symbols_str}].\n\n=== CRITICAL RULES (highest priority — override all other heuristics) ===\n1. You MUST evaluate the provided Sentiment Score and Reason. If the sentiment\n   indicates bearish conditions OR warns of rising BTC dominance (>60% or\n   climbing), you MUST apply a HEAVY penalty to any BUY signals. Do NOT\n   blindly follow the EMA trend if the macro sentiment is explicitly negative.\n2. Conversely, if sentiment is highly bullish (score >= 8), restrict SELL signals\n   — require stronger technical confirmation before scoring bearishly.\n3. When Fear & Greed is below 25 (Extreme Fear), presume continued downside\n   unless strong reversal evidence exists. When above 75 (Extreme Greed),\n   presume overextension and penalize aggressive longs.\n\n=== Initial analyst opinion (Round 1) ===\n{r1_summary}\n\n=== Macro & on-chain (Round 2) ===\n- BTC Dominance: {dom_block}  (rising = capital fleeing alts to BTC)\n- Per-symbol funding (8h, positive = longs pay shorts; >0.05% = crowded long):\n{funding_block}\n- Fear & Greed: {fng_block}\n\n=== Per-symbol market state ===\n{market_ctx_str}\n\n=== Reference headlines (top 8) ===\n{bullets}\n\n=== Your job ===\nRe-examine the analyst view against the fresh data. The basket includes alts\n(SOL, ADA), so penalize bullishness when BTC dominance is climbing. Penalize\nbullishness if multiple symbols show crowded-long funding. Reward bearishness\nif multiple symbols are already RSI-stretched in the opposite direction of the news.\n\nBe more decisive than the initial analyst alone (use supplementary data to\nsharpen the call). Stay within the same output schema.\n\nOutput strictly three lines:\nSCORE: <integer 1-10>\nCONFIDENCE: <decimal 0.0-1.0>\nREASON: <one short sentence on what shifted vs the initial analyst view>",
     # Active trading universe — editable from the dashboard. Empty/missing
     # falls back to config.SYMBOLS in callers.
     "symbols": list(config.SYMBOLS),

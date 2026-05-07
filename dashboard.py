@@ -57,6 +57,8 @@ EDITABLE_FIELDS: dict[str, type] = {
     "AUTO_CAPITAL_TUNE": bool,
     "AUTO_STRATEGY_EVOLVE": bool,
     "TRADE_GATE_ENABLED": bool,
+    "AI_ROUND1_PROMPT": str,
+    "AI_JUDGE_PROMPT": str,
 }
 
 # Per-symbol sizing/leverage validation. Bounds are sanity ceilings — change

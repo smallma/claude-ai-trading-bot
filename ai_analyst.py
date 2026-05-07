@@ -223,23 +223,17 @@ def _build_round1_prompt(headlines: list[str], fng: Optional[dict],
     bullets = "\n".join(f"- {h}" for h in headlines)
     fng_block = f"{fng['value']}/100 ({fng['classification']})" if fng else "(unavailable)"
     symbols_str = ", ".join(symbols)
-    return f"""You are a crypto market sentiment analyst tuning SHARED parameters
-for an automated perpetual futures bot trading a basket of {symbols_str}.
-Your scoring should reflect the broad crypto regime (it applies to all symbols).
-
-Recent crypto headlines (last hour, multi-source):
-{bullets}
-
-Fear & Greed Index: {fng_block}
-
-Current per-symbol market state:
-{_format_market_context(market_ctx)}
-
-Output strictly three lines:
-SCORE: <integer 1-10>
-CONFIDENCE: <decimal 0.0-1.0>
-REASON: <one short sentence>
-"""
+    market_ctx_str = _format_market_context(market_ctx)
+    
+    current_settings = settings.load()
+    prompt_template = current_settings.get("AI_ROUND1_PROMPT", settings.DEFAULTS["AI_ROUND1_PROMPT"])
+    
+    # Use replace to avoid KeyError if the user adds arbitrary braces { } in their prompt
+    return prompt_template \
+        .replace("{symbols_str}", symbols_str) \
+        .replace("{bullets}", bullets) \
+        .replace("{fng_block}", fng_block) \
+        .replace("{market_ctx_str}", market_ctx_str)
 
 
 def _build_judge_prompt(round1_results: list[tuple[str, dict]], headlines: list[str],
@@ -255,56 +249,25 @@ def _build_judge_prompt(round1_results: list[tuple[str, dict]], headlines: list[
         for sym, r in funding_rates.items()
     ) or "  (none)"
     symbols_str = ", ".join(symbols)
+    market_ctx_str = _format_market_context(market_ctx)
 
     r1_summary = "\n".join(
         f"  {name}: score={r['score']}/10 conf={r['confidence']:.2f} — {r['reason']}"
         for name, r in round1_results
     )
 
-    return f"""You are the FINAL JUDGE re-evaluating an initial analyst opinion
-against fresh macro/on-chain data, producing ONE shared parameter decision for a
-multi-symbol perp bot trading the basket [{symbols_str}].
+    current_settings = settings.load()
+    prompt_template = current_settings.get("AI_JUDGE_PROMPT", settings.DEFAULTS["AI_JUDGE_PROMPT"])
 
-=== CRITICAL RULES (highest priority — override all other heuristics) ===
-1. You MUST evaluate the provided Sentiment Score and Reason. If the sentiment
-   indicates bearish conditions OR warns of rising BTC dominance (>60% or
-   climbing), you MUST apply a HEAVY penalty to any BUY signals. Do NOT
-   blindly follow the EMA trend if the macro sentiment is explicitly negative.
-2. Conversely, if sentiment is highly bullish (score >= 8), restrict SELL signals
-   — require stronger technical confirmation before scoring bearishly.
-3. When Fear & Greed is below 25 (Extreme Fear), presume continued downside
-   unless strong reversal evidence exists. When above 75 (Extreme Greed),
-   presume overextension and penalize aggressive longs.
-
-=== Initial analyst opinion (Round 1) ===
-{r1_summary}
-
-=== Macro & on-chain (Round 2) ===
-- BTC Dominance: {dom_block}  (rising = capital fleeing alts to BTC)
-- Per-symbol funding (8h, positive = longs pay shorts; >0.05% = crowded long):
-{funding_block}
-- Fear & Greed: {fng_block}
-
-=== Per-symbol market state ===
-{_format_market_context(market_ctx)}
-
-=== Reference headlines (top 8) ===
-{bullets}
-
-=== Your job ===
-Re-examine the analyst view against the fresh data. The basket includes alts
-(SOL, ADA), so penalize bullishness when BTC dominance is climbing. Penalize
-bullishness if multiple symbols show crowded-long funding. Reward bearishness
-if multiple symbols are already RSI-stretched in the opposite direction of the news.
-
-Be more decisive than the initial analyst alone (use supplementary data to
-sharpen the call). Stay within the same output schema.
-
-Output strictly three lines:
-SCORE: <integer 1-10>
-CONFIDENCE: <decimal 0.0-1.0>
-REASON: <one short sentence on what shifted vs the initial analyst view>
-"""
+    # Use replace to avoid KeyError if the user adds arbitrary braces { } in their prompt
+    return prompt_template \
+        .replace("{symbols_str}", symbols_str) \
+        .replace("{r1_summary}", r1_summary) \
+        .replace("{dom_block}", dom_block) \
+        .replace("{funding_block}", funding_block) \
+        .replace("{fng_block}", fng_block) \
+        .replace("{market_ctx_str}", market_ctx_str) \
+        .replace("{bullets}", bullets)
 
 
 # ---------- Model callers ----------

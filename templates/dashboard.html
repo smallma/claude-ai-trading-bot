@@ -307,6 +307,21 @@ function renderConfig(s) {
     </div>
     <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
       <div class="muted small" style="margin-bottom:6px; text-transform:uppercase; letter-spacing:0.04em">
+        AI Prompts
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <label>
+          <div class="small muted">AI_ROUND1_PROMPT</div>
+          <textarea id="ed-r1" style="width: 100%; height: 100px; font-family: monospace; font-size: 11px;">${escapeHtml(cfg.AI_ROUND1_PROMPT || "")}</textarea>
+        </label>
+        <label>
+          <div class="small muted">AI_JUDGE_PROMPT</div>
+          <textarea id="ed-judge" style="width: 100%; height: 100px; font-family: monospace; font-size: 11px;">${escapeHtml(cfg.AI_JUDGE_PROMPT || "")}</textarea>
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
+      <div class="muted small" style="margin-bottom:6px; text-transform:uppercase; letter-spacing:0.04em">
         Symbols, Sizing & Leverage
       </div>
       <div id="symbol-table-wrap"></div>
@@ -490,6 +505,8 @@ async function saveConfig() {
     TRADE_GATE_ENABLED: $("ed-gate").checked,
     AUTO_CAPITAL_TUNE: $("ed-cap").checked,
     AUTO_STRATEGY_EVOLVE: $("ed-evo").checked,
+    AI_ROUND1_PROMPT: $("ed-r1").value,
+    AI_JUDGE_PROMPT: $("ed-judge").value,
     symbols: symbolsList,
     symbol_configs: symbolConfigs,
   };

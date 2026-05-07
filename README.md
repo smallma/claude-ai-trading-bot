@@ -196,8 +196,10 @@ AI modules.
 | `TRADE_SIZE_MULTIPLIER` | `1.0` | Scalar applied to every symbol's base size |
 | `DAILY_LOSS_LIMIT` | `0.02` | Drawdown threshold for kill switch (anchored at startup) |
 | `TRADE_GATE_ENABLED` | `true` | Toggle the per-trade dual-AI gate (false = pure RSI) |
-| `AUTO_CAPITAL_TUNE` | `false` | If false, `ai_analyst` writes `ai_meta.suggested_capital` for manual Apply. If true, it overwrites live `TRADE_SIZE_MULTIPLIER`/`DAILY_LOSS_LIMIT` directly |
+| `AUTO_CAPITAL_TUNE` | `true` | If false, `ai_analyst` writes `ai_meta.suggested_capital` for manual Apply. If true, it overwrites live `TRADE_SIZE_MULTIPLIER`/`DAILY_LOSS_LIMIT` directly |
 | `AUTO_STRATEGY_EVOLVE` | `false` | If false, `strategy_reviewer` writes `ai_meta.suggested_strategy` for manual Apply. If true, validated overrides go straight into `strategy_overrides` |
+| `AI_ROUND1_PROMPT` | `(template)` | Editable instruction template for the Round 1 model (Gemini/MiniMax base) |
+| `AI_JUDGE_PROMPT` | `(template)` | Editable instruction template for the Round 3 synthesis judge |
 | `strategy_overrides` | `{}` | Per-key shadow values for `RSI_OVERSOLD`/`RSI_OVERBOUGHT`/`EMA_FAST_PERIOD`/`EMA_SLOW_PERIOD`/`BB_PERIOD`/`BB_STDEV` |
 | `ai_meta.last_sentiment` | `null` | Final 1-10 score from Round 3 |
 | `ai_meta.last_confidence` | `null` | Final confidence 0-1 |

@@ -19,7 +19,7 @@ BASE_TRADE_SIZE_USD = {
 # Per-symbol leverage default — fallback only. Runtime value lives in
 # config.json -> symbol_configs[symbol].leverage. Bot pushes the value to
 # Hyperliquid via exchange.update_leverage() whenever it changes.
-DEFAULT_LEVERAGE = 1
+DEFAULT_LEVERAGE = 20
 DEFAULT_LEVERAGE_IS_CROSS = True
 
 # When the dashboard adds a brand-new symbol that has no symbol_configs entry,
