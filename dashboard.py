@@ -239,16 +239,35 @@ def api_state():
         except Exception as e:
             log.warning(f"equity fetch failed: {e}")
 
-    # Last 50 trades, newest first. Each record already has trade_id so the UI
-    # can group ENTRY+EXIT pairs.
+    # Last 50 completed trades, newest first.
     all_records = list(journal.iter_records())
-    recent = all_records[-50:][::-1]
+    
+    trades_map = {}
+    for r in all_records:
+        tid = r.get("trade_id")
+        if not tid:
+            continue
+        if tid not in trades_map:
+            trades_map[tid] = {"trade_id": tid, "entry": None, "exit": None}
+        
+        typ = r.get("type")
+        if typ == "ENTRY":
+            trades_map[tid]["entry"] = r
+        elif typ == "EXIT":
+            trades_map[tid]["exit"] = r
+
+    completed_trades = [
+        pair for pair in trades_map.values()
+        if pair["entry"] is not None and pair["exit"] is not None
+    ]
+    completed_trades.sort(key=lambda x: x["exit"].get("ts", ""), reverse=True)
+    recent_completed = completed_trades[:50]
 
     return jsonify({
         "config": cfg,
         "positions": positions,
         "equity": equity,
-        "trades": recent,
+        "completed_trades": recent_completed,
         "static": {
             # Active universe (dashboard-editable) — lets the UI render
             # per-symbol controls without a second round trip.

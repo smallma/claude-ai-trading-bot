@@ -41,6 +41,7 @@ _last_equity_log_ts: float = 0.0
 # the position goes flat. In-memory only — bot restart resets the high-water
 # mark, which means a position already past +30% would re-arm from current ROE.
 _position_max_roe: dict[str, float] = {}
+_position_min_roe: dict[str, float] = {}
 
 # Persistent leverage cache lives in config.json under
 # symbol_configs[sym].applied_leverage so it survives bot restarts and we
@@ -88,6 +89,7 @@ def _journal_exit_before_close(
     pos: dict,
     exit_reason: str,
     max_roe_pct: Optional[float],
+    min_roe_pct: Optional[float],
     final_roe_pct: Optional[float],
     exit_price: Optional[float] = None,
 ) -> None:
@@ -132,7 +134,12 @@ def _journal_exit_before_close(
         "hold_seconds": hold_seconds,
         "max_roe_pct": round(max_roe_pct, 2) if max_roe_pct is not None else None,
         "final_roe_pct": round(final_roe_pct, 2) if final_roe_pct is not None else None,
+        "trade_max_drawdown_pct": abs(round(min_roe_pct, 2)) if min_roe_pct is not None and min_roe_pct < 0 else 0.0,
         "pnl_usd": round(pnl_usd, 4) if pnl_usd is not None else None,
+        "entry_ai_score": meta.get("entry_ai_score"),
+        "entry_fng_value": meta.get("entry_fng_value"),
+        "entry_rsi": meta.get("entry_rsi"),
+        "entry_ema_spread_pct": meta.get("entry_ema_spread_pct"),
     }
     journal.log_exit(
         symbol=symbol,
@@ -184,13 +191,15 @@ def execute_signal(client: HyperliquidClient, symbol: str, signal: str,
         try:
             roe = _compute_roe_pct(pos) if pos else None
             max_roe = _position_max_roe.get(symbol, roe)
+            min_roe = _position_min_roe.get(symbol, roe)
             _journal_exit_before_close(
                 client, symbol, pos or {}, "opposite_signal",
-                max_roe, roe, exit_price=price,
+                max_roe, min_roe, roe, exit_price=price,
             )
         except Exception as e:
             log.warning(f"[{symbol}] flip EXIT journal failed: {e}")
         _position_max_roe.pop(symbol, None)
+        _position_min_roe.pop(symbol, None)
     else:
         log.info(
             f"[{symbol}] OPEN: target={target_size:.4f} "
@@ -250,6 +259,12 @@ def execute_signal(client: HyperliquidClient, symbol: str, signal: str,
     except Exception as e:
         log.warning(f"[{symbol}] ENTRY journal failed: {e}")
 
+    ai_score = decision_context.get("ai_meta", {}).get("last_sentiment")
+    fng_value = None
+    fng = decision_context.get("ai_meta", {}).get("last_fng")
+    if isinstance(fng, dict):
+        fng_value = fng.get("value")
+
     _position_entry_meta[symbol] = {
         "trade_id": trade_id,
         "entry_price": actual_fill_price,
@@ -257,9 +272,14 @@ def execute_signal(client: HyperliquidClient, symbol: str, signal: str,
         "side": entry_side,
         "size_usd": entry_size_usd,
         "size_units": actual_size_units,
+        "entry_ai_score": ai_score,
+        "entry_fng_value": fng_value,
+        "entry_rsi": decision_context.get("tech", {}).get("rsi"),
+        "entry_ema_spread_pct": decision_context.get("tech", {}).get("ema_spread_pct"),
     }
     # Fresh position -> reset the trailing-stop high-water mark.
     _position_max_roe.pop(symbol, None)
+    _position_min_roe.pop(symbol, None)
 
 
 def _gather_symbol_state(client: HyperliquidClient, symbol: str) -> dict:
@@ -419,6 +439,10 @@ def _check_trailing_stop(symbol: str, roe: float) -> Optional[tuple[float, float
     new_max = roe if prev_max is None else max(prev_max, roe)
     _position_max_roe[symbol] = new_max
 
+    prev_min = _position_min_roe.get(symbol)
+    new_min = roe if prev_min is None else min(prev_min, roe)
+    _position_min_roe[symbol] = new_min
+
     armed_floor: Optional[float] = None
     for tier_arm, tier_floor in config.TRAILING_TIERS:
         if new_max >= tier_arm:
@@ -443,6 +467,7 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
 
     if pos is None:
         _position_max_roe.pop(symbol, None)
+        _position_min_roe.pop(symbol, None)
         # Don't drop entry meta here — flat-on-restart is fine, but if the
         # position was closed externally (manual UI close) we lose the EXIT
         # journal record. That's acceptable: meta will be overwritten on next
@@ -457,12 +482,14 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
                     f"[{symbol}] [Trailing Stop Triggered] max ROE {max_seen:+.2f}% -> "
                     f"floor {floor:+.2f}%, current {roe:+.2f}%; closing position."
                 )
-                _journal_exit_before_close(client, symbol, pos, "trailing_stop", max_seen, roe)
+                min_seen = _position_min_roe.get(symbol, roe)
+                _journal_exit_before_close(client, symbol, pos, "trailing_stop", max_seen, min_seen, roe)
                 try:
                     client.market_close(symbol)
                 except Exception as e:
                     log.error(f"[{symbol}] trailing-stop close failed: {e}")
                 _position_max_roe.pop(symbol, None)
+                _position_min_roe.pop(symbol, None)
                 return
             else:
                 log.info(f"[{symbol}] ROE {roe:+.2f}% (max {_position_max_roe.get(symbol, roe):+.2f}%)")
@@ -606,8 +633,9 @@ def _process_force_close_queue(client: HyperliquidClient,
         else:
             roe = _compute_roe_pct(pos) or 0.0
             max_roe = _position_max_roe.get(symbol, roe)
+            min_roe = _position_min_roe.get(symbol, roe)
             try:
-                _journal_exit_before_close(client, symbol, pos, "manual_close", max_roe, roe)
+                _journal_exit_before_close(client, symbol, pos, "manual_close", max_roe, min_roe, roe)
             except Exception as e:
                 log.warning(f"[{symbol}] manual close journal failed: {e}")
             try:
@@ -616,6 +644,7 @@ def _process_force_close_queue(client: HyperliquidClient,
             except Exception as e:
                 log.error(f"[{symbol}] manual close failed: {e}")
             _position_max_roe.pop(symbol, None)
+            _position_min_roe.pop(symbol, None)
 
     # Re-load before write-back so we don't clobber any close requests the
     # dashboard added DURING our market_close round trip. Only remove the

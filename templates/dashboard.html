@@ -166,11 +166,18 @@
   </section>
 
   <section class="panel" style="grid-column: 1 / -1">
-    <h2>Recent Trades (latest 50)</h2>
-    <table id="trades">
+    <h2>Completed Trades (latest 50)</h2>
+    <table id="trades-table" style="font-size: 0.9em;">
       <thead><tr>
-        <th>Time (UTC)</th><th>Type</th><th>Symbol</th><th>Side</th>
-        <th>Price</th><th>Size USD</th><th>Reason / Trigger</th><th>ROE / PnL</th>
+        <th>Entry / Exit (UTC)</th>
+        <th>Symbol</th>
+        <th>Side</th>
+        <th>Entry / Exit Px</th>
+        <th>Hold Time</th>
+        <th>Exit Reason</th>
+        <th>Drawdown</th>
+        <th>Context (AI/FNG/RSI/EMA%)</th>
+        <th>ROE / PnL</th>
       </tr></thead>
       <tbody id="trades-body"></tbody>
     </table>
@@ -208,7 +215,7 @@ async function refresh() {
     renderSuggestion(s);
     renderStrategyParams(s);
     renderStrategyReview(s);
-    renderTrades(s.trades || []);
+    renderTrades(s.completed_trades || []);
     $("last-refresh").textContent = "refreshed " + fmtTs(s.now);
     $("env-badge").textContent = s.static.USE_TESTNET ? "TESTNET" : "MAINNET";
     $("env-badge").style.color = s.static.USE_TESTNET ? "var(--amber)" : "var(--red)";
@@ -762,42 +769,60 @@ async function applyStrategySuggestion() {
   }
 }
 
-function renderTrades(trades) {
+function renderTrades(completed_trades) {
   const tbody = $("trades-body");
   tbody.innerHTML = "";
-  if (!trades.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="muted">No trades recorded yet.</td></tr>`;
+  if (!completed_trades.length) {
+    tbody.innerHTML = `<tr><td colspan="9" class="muted">No completed trades recorded yet.</td></tr>`;
     return;
   }
-  for (const t of trades) {
+  for (const pair of completed_trades) {
     const tr = document.createElement("tr");
     tr.className = "tr-clickable";
-    const isEntry = t.type === "ENTRY";
-    const reason = isEntry
-      ? (t.decision_context?.trigger || "—")
-      : (t.exit_context?.exit_reason || "—");
-    let roeCell = "—";
-    if (!isEntry && t.exit_context) {
-      const fr = t.exit_context.final_roe_pct;
-      const pnl = t.exit_context.pnl_usd;
-      roeCell = (fr != null ? fmt(fr,2)+"%" : "—") + (pnl != null ? ` / $${fmt(pnl,2)}` : "");
+    const entry = pair.entry;
+    const exit = pair.exit;
+    const ctx = exit.exit_context || {};
+    
+    // Hold time
+    let holdStr = "—";
+    if (ctx.hold_seconds != null) {
+        if (ctx.hold_seconds < 60) holdStr = `${ctx.hold_seconds}s`;
+        else if (ctx.hold_seconds < 3600) holdStr = `${Math.floor(ctx.hold_seconds / 60)}m`;
+        else holdStr = `${fmt(ctx.hold_seconds / 3600, 1)}h`;
     }
+    
+    // Drawdown
+    const dd = ctx.trade_max_drawdown_pct;
+    const ddStr = dd != null ? `${fmt(dd, 2)}%` : "—";
+
+    // Evidence
+    const ai = ctx.entry_ai_score != null ? fmt(ctx.entry_ai_score, 1) : "-";
+    const fng = ctx.entry_fng_value != null ? Math.round(ctx.entry_fng_value) : "-";
+    const rsi = ctx.entry_rsi != null ? fmt(ctx.entry_rsi, 1) : "-";
+    const ema = ctx.entry_ema_spread_pct != null ? fmt(ctx.entry_ema_spread_pct, 2) : "-";
+
+    const fr = ctx.final_roe_pct;
+    const pnl = ctx.pnl_usd;
+    const roeCell = (fr != null ? fmt(fr,2)+"%" : "—") + (pnl != null ? ` / $${fmt(pnl,2)}` : "");
+    const isWin = pnl != null ? pnl >= 0 : (fr != null ? fr >= 0 : true);
+
     tr.innerHTML = `
-      <td>${fmtTs(t.ts)}</td>
-      <td><span class="pill ${isEntry?'long':'skip'}">${t.type}</span></td>
-      <td>${t.symbol || ""}</td>
-      <td>${t.side || ""}</td>
-      <td>$${fmt(t.fill_price, 4)}</td>
-      <td>$${fmt(t.size_usd, 2)}</td>
-      <td class="small">${escapeHtml(reason)}</td>
-      <td>${roeCell}</td>
+      <td class="small">${fmtTs(entry.ts)}<br><span class="muted">${fmtTs(exit.ts)}</span></td>
+      <td><strong>${entry.symbol || ""}</strong></td>
+      <td><span class="pill ${entry.side === 'LONG'?'long':'short'}">${entry.side}</span></td>
+      <td class="small">$${fmt(entry.fill_price, 4)}<br><span class="muted">$${fmt(exit.fill_price, 4)}</span></td>
+      <td>${holdStr}</td>
+      <td class="small">${escapeHtml(ctx.exit_reason || "—")}</td>
+      <td style="color:red">${ddStr}</td>
+      <td class="small" style="opacity: 0.85">${ai} / ${fng} / ${rsi} / ${ema}%</td>
+      <td style="font-weight:bold; color: ${isWin ? 'var(--long-color)' : 'var(--short-color)'}">${roeCell}</td>
     `;
-    tr.addEventListener("click", () => toggleDetail(tr, t));
+    tr.addEventListener("click", () => toggleDetail(tr, pair));
     tbody.appendChild(tr);
   }
 }
 
-function toggleDetail(tr, rec) {
+function toggleDetail(tr, pair) {
   const next = tr.nextElementSibling;
   if (next && next.classList.contains("detail")) {
     next.remove();
@@ -806,15 +831,11 @@ function toggleDetail(tr, rec) {
   const detailRow = document.createElement("tr");
   detailRow.className = "detail";
   const td = document.createElement("td");
-  td.colSpan = 8;
-  const ctx = rec.type === "ENTRY" ? rec.decision_context : rec.exit_context;
+  td.colSpan = 9;
   td.textContent = JSON.stringify({
-    trade_id: rec.trade_id,
-    ts: rec.ts,
-    fill_price: rec.fill_price,
-    size_usd: rec.size_usd,
-    size_units: rec.size_units,
-    [rec.type === "ENTRY" ? "decision_context" : "exit_context"]: ctx,
+    trade_id: pair.entry.trade_id,
+    entry: pair.entry,
+    exit: pair.exit
   }, null, 2);
   detailRow.appendChild(td);
   tr.after(detailRow);
