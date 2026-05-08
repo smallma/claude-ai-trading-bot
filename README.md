@@ -168,6 +168,8 @@ The system has three layers of configuration, in order of how often they change:
 |---|---|---|
 | `SYMBOLS` | `["SOL", "ETH", "ADA"]` | Hyperliquid perp symbols traded in parallel |
 | `BASE_TRADE_SIZE_USD` | `{SOL: 40, ETH: 40, ADA: 20}` | Per-symbol base notional. Final size = base × `TRADE_SIZE_MULTIPLIER` |
+| `NEW_SYMBOL_DEFAULT_BASE_USD` | `20.0` | Default base size for new dashboard symbols |
+| `NEW_SYMBOL_DEFAULT_LEVERAGE` | `20` | Default leverage for new dashboard symbols |
 | `LOOP_SECONDS` | `60` | Bot tick interval |
 | `CANDLE_INTERVAL` | `"1m"` | Candle resolution feeding RSI |
 | `RSI_PERIOD` | `14` | Wilder RSI lookback |
@@ -198,8 +200,8 @@ AI modules.
 | `TRADE_GATE_ENABLED` | `true` | Toggle the per-trade dual-AI gate (false = pure RSI) |
 | `AUTO_CAPITAL_TUNE` | `true` | If false, `ai_analyst` writes `ai_meta.suggested_capital` for manual Apply. If true, it overwrites live `TRADE_SIZE_MULTIPLIER`/`DAILY_LOSS_LIMIT` directly |
 | `AUTO_STRATEGY_EVOLVE` | `false` | If false, `strategy_reviewer` writes `ai_meta.suggested_strategy` for manual Apply. If true, validated overrides go straight into `strategy_overrides` |
-| `AI_ROUND1_PROMPT` | `(template)` | Editable instruction template for the Round 1 model (Gemini/MiniMax base) |
-| `AI_JUDGE_PROMPT` | `(template)` | Editable instruction template for the Round 3 synthesis judge |
+| `AI_ROUND1_PROMPT` | `(template)` | Editable instruction template for the Round 1 model (Gemini/MiniMax base). Falls back to `config.py` if missing |
+| `AI_JUDGE_PROMPT` | `(template)` | Editable instruction template for the Round 3 synthesis judge. Falls back to `config.py` if missing |
 | `strategy_overrides` | `{}` | Per-key shadow values for `RSI_OVERSOLD`/`RSI_OVERBOUGHT`/`EMA_FAST_PERIOD`/`EMA_SLOW_PERIOD`/`BB_PERIOD`/`BB_STDEV` |
 | `ai_meta.last_sentiment` | `null` | Final 1-10 score from Round 3 |
 | `ai_meta.last_confidence` | `null` | Final confidence 0-1 |
@@ -278,8 +280,13 @@ EXIT records share the `trade_id` and add `exit_context`:
     "entry_ts": "2026-05-07T08:42:11Z",
     "hold_seconds": 2531,
     "max_roe_pct": 31.2,
+    "trade_max_drawdown_pct": 4.1,
     "final_roe_pct": 15.0,
-    "pnl_usd": 0.62
+    "pnl_usd": 0.62,
+    "entry_ai_score": 6,
+    "entry_fng_value": 47,
+    "entry_rsi": 19.5,
+    "entry_ema_spread_pct": -2.3
   }
 }
 ```
