@@ -4,17 +4,22 @@ A fully automated multi-symbol perpetual trading bot for **Hyperliquid** with a
 web dashboard, structured trade journal, and a self-improving strategy
 reviewer:
 
-1. **Sentiment engine** — MiniMax scores broad crypto sentiment every 15 min
+1. **Mean-reversion strategy** — enters on Bollinger Band breakouts confirmed
+   by RSI extremes and a Fear & Greed dual filter (BUY only when F&G < 40,
+   SELL only when F&G > 60). Left-side averaging lets the bot add to a
+   position up to 3× the base notional before the cap kicks in.
+2. **Sentiment engine** — MiniMax scores broad crypto sentiment every 15 min
    from 6 free RSS feeds + Fear & Greed + on-chain context (BTC dominance,
    funding rates), then tunes position sizing.
-2. **Dual-AI trade gate** — every BUY/SELL signal is reviewed by Gemini AND
+3. **Dual-AI trade gate** — every BUY/SELL signal is reviewed by Gemini AND
    MiniMax in parallel; both must approve before the order goes in.
-3. **Trade journal** — every ENTRY/EXIT is logged as one JSONL line with the
+4. **Trade journal** — every ENTRY/EXIT is logged as one JSONL line with the
    full decision context (RSI/EMA/BB readings, AI votes, sentiment, funding,
-   config snapshot) so every trade is later attributable.
-4. **Flask + Caddy dashboard** — live positions, equity curve, per-symbol PnL,
-   editable config, AI suggestions with one-click Apply, journal download.
-5. **Daily strategy reviewer** — Gemini 2.5 Pro digests the journal each night
+   config snapshot); every tick decision is also logged to `data/judgments.jsonl`.
+5. **Flask + Caddy dashboard** — live positions, Fear & Greed gauge, equity
+   curve, per-symbol PnL, Decision History table, editable config, AI
+   suggestions with one-click Apply, journal download.
+6. **Daily strategy reviewer** — Gemini 2.5 Pro digests the journal each night
    and proposes RSI/EMA/BB parameter tweaks within hard safety bounds; the
    operator approves them on the dashboard (or `AUTO_STRATEGY_EVOLVE=True`
    applies them automatically).
@@ -30,16 +35,18 @@ limits.
 ┌────────────────────────── bot.py (every 60s) ──────────────────────────┐
 │                                                                         │
 │  kill switch ──► tick():                                                │
-│    sample equity                                  ┐                     │
-│    log equity (every 5 min) ─► journal/equity-*.jsonl                   │
+│    sample equity                                                        │
+│    log equity (every 5 min) ─► journal/equity-*.jsonl                  │
 │    for symbol in [SOL, ETH, ADA]:                                       │
-│      1) trailing-stop check on existing position  │                     │
-│      2) candles → RSI(14) + EMA(9,21) + BB(20,2)  │                     │
-│      3) composite signal (BUY/SELL/HOLD)          │                     │
-│      4) Trade Gate (Gemini ‖ MiniMax) — both GO   │                     │
-│      5) market_open                               │                     │
-│           ENTRY ─► journal/journal-*.jsonl ◄──────┘                     │
-│      EXIT (trailing/flip/kill) ─► journal/journal-*.jsonl               │
+│      1) auto take-profit check (ROE >= AUTO_TAKE_PROFIT_PCT)           │
+│      2) trailing-stop check on existing position                        │
+│      3) candles → RSI(14) + EMA(9,21) + BB(20,2)                      │
+│      4) mean-reversion signal: BB break + RSI extreme + F&G filter     │
+│      5) Trade Gate (Gemini ‖ MiniMax) — both GO                        │
+│      6) market_open (or add-to-position, capped at 3× base)            │
+│           ENTRY ─► journal/journal-*.jsonl                              │
+│           judgment ─► data/judgments.jsonl (every tick incl. HOLD)     │
+│      EXIT (take_profit/trailing/flip/kill) ─► journal/journal-*.jsonl  │
 └─────────────────────────────────────────────────────────────────────────┘
                        ▲                   ▲                ▲
                        │ reads             │ reads          │ reads
@@ -52,38 +59,40 @@ limits.
               │  RSS + FNG +    │  │  Pairs trades  │  │  /api/config   │
               │  funding +      │  │  → stats →     │  │  /api/equity-* │
               │  BTC dom        │  │  Gemini 2.5    │  │  /api/pnl-*    │
-              │                 │  │  Pro           │  │  /api/run-     │
-              │  → suggested_   │  │                │  │   reviewer     │
-              │    capital      │  │  → suggested_  │  │  /api/apply-*  │
-              │    or live      │  │    strategy or │  │  /api/download │
-              │    (gated by    │  │    overrides   │  │                │
-              │    AUTO_CAPI    │  │  (gated by     │  │  Charts:       │
-              │    TAL_TUNE)    │  │   AUTO_STRAT.  │  │   • equity     │
-              │                 │  │   EVOLVE)      │  │   • PnL/symbol │
-              └────────┬────────┘  └───────┬────────┘  └────────┬───────┘
-                       │                   │                    │
-                       ▼                   ▼                    ▼
+              │                 │  │  Pro           │  │  /api/judgments│
+              │  → suggested_   │  │                │  │  /api/run-     │
+              │    capital      │  │  → suggested_  │  │   reviewer     │
+              │    or live      │  │    strategy or │  │  /api/apply-*  │
+              │    (gated by    │  │    overrides   │  │  /api/download │
+              │    AUTO_CAPI    │  │  (gated by     │  │                │
+              │    TAL_TUNE)    │  │   AUTO_STRAT.  │  │  Charts:       │
+              │                 │  │   EVOLVE)      │  │   • equity     │
+              └────────┬────────┘  └───────┬────────┘  │   • PnL/symbol │
+                       │                   │            │   • F&G gauge  │
+                       ▼                   ▼            │   • Decisions  │
                   ┌──────────────────────────────────────────────────┐
                   │                  config.json                     │
                   │  TRADE_SIZE_MULTIPLIER, DAILY_LOSS_LIMIT,        │
                   │  AUTO_CAPITAL_TUNE, AUTO_STRATEGY_EVOLVE,        │
-                  │  TRADE_GATE_ENABLED, strategy_overrides{},       │
-                  │  ai_meta{ suggested_capital, suggested_strategy }│
+                  │  AUTO_TAKE_PROFIT_PCT, TRADE_GATE_ENABLED,       │
+                  │  strategy_overrides{},                           │
+                  │  ai_meta{ suggested_capital, suggested_strategy, │
+                  │           last_fng, btc_dominance, ... }         │
                   └──────────────────────────────────────────────────┘
 ```
 
 | File | Role |
 |---|---|
-| `bot.py` | Main 60-second tick loop, multi-symbol orchestration, journal writes, equity sampler |
-| `strategy.py` | Composite signal — EMA trend filter + RSI/Bollinger entry. Reads `strategy_overrides` from `config.json` first, falls back to `config.py` |
+| `bot.py` | Main 60-second tick loop, multi-symbol orchestration, take-profit / trailing-stop, left-side averaging, journal writes, equity sampler |
+| `strategy.py` | Mean-reversion signal — BB breakout + RSI extreme + F&G dual filter. EMA computed for logging only. Reads `strategy_overrides` from `config.json` first, falls back to `config.py` |
 | `exchange.py` | Hyperliquid SDK wrapper |
 | `risk.py` | Account-level drawdown kill switch |
 | `ai_analyst.py` | 3-round AI sentiment cycle. Honours `AUTO_CAPITAL_TUNE` (suggestion vs. live apply) |
 | `trade_gate.py` | Dual-AI per-trade approval gate (returns structured votes for journal) |
-| `journal.py` | Append-only JSONL trade & equity journals; monthly rotation; 6-month retention |
+| `journal.py` | Append-only JSONL trade & equity journals; monthly rotation; 6-month retention. Also writes every-tick judgment log to `data/judgments.jsonl` |
 | `strategy_reviewer.py` | Daily reviewer — pairs trades, computes stats, asks Gemini Pro for parameter tweaks within safety bounds |
 | `dashboard.py` | Flask app on `127.0.0.1:8080`. JSON API + single-page UI |
-| `templates/dashboard.html` | Single-page dashboard. Vanilla JS + Chart.js (CDN) |
+| `templates/dashboard.html` | Single-page dashboard. Vanilla JS + Chart.js + DataTables (CDN) |
 | `deploy/Caddyfile` | Public HTTPS reverse proxy with Basic Auth |
 | `deploy/bot.service` | systemd unit for the bot |
 | `deploy/dashboard.service` | systemd unit for the dashboard |
@@ -171,14 +180,16 @@ The system has three layers of configuration, in order of how often they change:
 | `NEW_SYMBOL_DEFAULT_BASE_USD` | `20.0` | Default base size for new dashboard symbols |
 | `NEW_SYMBOL_DEFAULT_LEVERAGE` | `20` | Default leverage for new dashboard symbols |
 | `LOOP_SECONDS` | `60` | Bot tick interval |
-| `CANDLE_INTERVAL` | `"1m"` | Candle resolution feeding RSI |
+| `CANDLE_INTERVAL` | `"15m"` | Candle resolution feeding RSI / EMA / BB |
+| `CANDLE_LOOKBACK` | `100` | Number of candles fetched per tick |
 | `RSI_PERIOD` | `14` | Wilder RSI lookback |
-| `RSI_OVERSOLD` | `25.0` | Default; overridable from dashboard |
-| `RSI_OVERBOUGHT` | `75.0` | Default; overridable from dashboard |
-| `EMA_FAST_PERIOD` | `9` | Default; overridable from dashboard |
-| `EMA_SLOW_PERIOD` | `21` | Default; overridable from dashboard |
+| `RSI_OVERSOLD` | `30.0` | Default; overridable from dashboard |
+| `RSI_OVERBOUGHT` | `70.0` | Default; overridable from dashboard |
+| `EMA_FAST_PERIOD` | `9` | Default; overridable from dashboard (logging only — not a gate) |
+| `EMA_SLOW_PERIOD` | `21` | Default; overridable from dashboard (logging only — not a gate) |
 | `BB_PERIOD` | `20` | Default; overridable from dashboard |
 | `BB_STDEV` | `2.0` | Default; overridable from dashboard |
+| `MAX_POSITION_MULTIPLIER` | `3` | Max allowed notional as a multiple of `base_usd × TRADE_SIZE_MULTIPLIER`. Prevents unlimited averaging |
 | `TRAILING_TIERS` | `[(15,0),(30,15)]` | `(arm ROE%, floor ROE%)` pairs |
 | `USE_TESTNET` | `False` | Switch to Hyperliquid testnet |
 | `AI_REFRESH_SECONDS` | `900` | How often `ai_analyst.run_once()` runs (15 min) |
@@ -200,13 +211,14 @@ AI modules.
 | `TRADE_GATE_ENABLED` | `true` | Toggle the per-trade dual-AI gate (false = pure RSI) |
 | `AUTO_CAPITAL_TUNE` | `true` | If false, `ai_analyst` writes `ai_meta.suggested_capital` for manual Apply. If true, it overwrites live `TRADE_SIZE_MULTIPLIER`/`DAILY_LOSS_LIMIT` directly |
 | `AUTO_STRATEGY_EVOLVE` | `false` | If false, `strategy_reviewer` writes `ai_meta.suggested_strategy` for manual Apply. If true, validated overrides go straight into `strategy_overrides` |
-| `AI_ROUND1_PROMPT` | `(template)` | Editable instruction template for the Round 1 model (Gemini/MiniMax base). Falls back to `config.py` if missing |
+| `AUTO_TAKE_PROFIT_PCT` | `10.0` | Close position when ROE% ≥ this value. Applies to both long and short. Checked every tick before the trailing stop. Dashboard-editable |
+| `AI_ROUND1_PROMPT` | `(template)` | Editable instruction template for the Round 1 model. Falls back to `config.py` if missing |
 | `AI_JUDGE_PROMPT` | `(template)` | Editable instruction template for the Round 3 synthesis judge. Falls back to `config.py` if missing |
 | `strategy_overrides` | `{}` | Per-key shadow values for `RSI_OVERSOLD`/`RSI_OVERBOUGHT`/`EMA_FAST_PERIOD`/`EMA_SLOW_PERIOD`/`BB_PERIOD`/`BB_STDEV` |
 | `ai_meta.last_sentiment` | `null` | Final 1-10 score from Round 3 |
 | `ai_meta.last_confidence` | `null` | Final confidence 0-1 |
 | `ai_meta.last_reason` | `null` | One-sentence rationale from the judge |
-| `ai_meta.last_fng` | `null` | Latest Fear & Greed Index value + classification |
+| `ai_meta.last_fng` | `null` | Latest Fear & Greed Index `{value, classification}` |
 | `ai_meta.btc_dominance` | `null` | BTC market cap dominance % |
 | `ai_meta.funding_rates` | `null` | Per-symbol 8h funding rates |
 | `ai_meta.suggested_capital` | `null` | Latest sentiment-driven capital suggestion (when `AUTO_CAPITAL_TUNE=false`) |
@@ -225,6 +237,10 @@ per UTC month). Equity samples every 5 minutes go to
 `journal/equity-YYYYMM.jsonl`. Files older than 6 months are deleted on bot
 startup (`journal.purge_old`).
 
+In addition, **every tick decision** (HOLD / SKIP / BUY / SELL) is appended to
+`data/judgments.jsonl` so the Decision History tab on the dashboard always
+has full visibility into why the bot did or did not trade.
+
 ENTRY records carry the full decision context that justified the trade:
 
 ```jsonc
@@ -238,8 +254,8 @@ ENTRY records carry the full decision context that justified the trade:
   "size_usd": 40.0,
   "size_units": 0.4759,
   "decision_context": {
-    "trigger": "RSI oversold",
-    "tech": { "rsi": 19.5, "ema_fast": 83.2, "ema_slow": 81.0,
+    "trigger": "BB lower break + RSI oversold",
+    "tech": { "rsi": 28.5, "ema_fast": 83.2, "ema_slow": 81.0,
               "ema_trend": "BULL", "bb_position": "below_lower", ... },
     "ai_gate": {
       "enabled": true,
@@ -248,13 +264,13 @@ ENTRY records carry the full decision context that justified the trade:
         "minimax": { "decision": "GO", "reason": "..." }
       }
     },
-    "sentiment": { "score": 6, "confidence": 0.7, "fng": 47, "reason": "..." },
+    "sentiment": { "score": 6, "confidence": 0.7, "fng": {"value": 32, "classification": "Fear"}, "reason": "..." },
     "btc_dominance": 58.4,
     "funding_rate": 0.0001,
     "session_pnl_pct": -0.3,
     "config_snapshot": {
       "TRADE_SIZE_MULTIPLIER": 1.0, "DAILY_LOSS_LIMIT": 0.02,
-      "RSI_OVERSOLD": 25.0, "RSI_OVERBOUGHT": 75.0,
+      "RSI_OVERSOLD": 30.0, "RSI_OVERBOUGHT": 70.0,
       "EMA_FAST_PERIOD": 9, "EMA_SLOW_PERIOD": 21,
       "BB_PERIOD": 20, "BB_STDEV": 2.0,
       "TRAILING_TIERS": [[15.0, 0.0], [30.0, 15.0]],
@@ -275,18 +291,18 @@ EXIT records share the `trade_id` and add `exit_context`:
   "side": "LONG",
   "fill_price": 86.40,
   "exit_context": {
-    "exit_reason": "trailing_stop",      // | opposite_signal | kill_switch
+    "exit_reason": "take_profit",        // | trailing_stop | opposite_signal | kill_switch | manual_close
     "entry_price": 84.05,
     "entry_ts": "2026-05-07T08:42:11Z",
     "hold_seconds": 2531,
-    "max_roe_pct": 31.2,
-    "trade_max_drawdown_pct": 4.1,
-    "final_roe_pct": 15.0,
-    "pnl_usd": 0.62,
+    "max_roe_pct": 12.4,
+    "trade_max_drawdown_pct": 2.1,
+    "final_roe_pct": 10.0,
+    "pnl_usd": 0.52,
     "entry_ai_score": 6,
-    "entry_fng_value": 47,
-    "entry_rsi": 19.5,
-    "entry_ema_spread_pct": -2.3
+    "entry_fng_value": 32,
+    "entry_rsi": 28.5,
+    "entry_ema_spread_pct": 2.7
   }
 }
 ```
@@ -304,12 +320,15 @@ python dashboard.py
 # → http://127.0.0.1:8080  (loopback only — never expose 8080 publicly)
 ```
 
-Sections:
+Panels:
 
+- **Fear & Greed gauge** — colour-coded bar above the positions panel.
+  < 40 green (Panic — BUY zone allowed), 40-60 grey (Neutral), > 60 red
+  (Greed — SELL zone allowed). Updates every 30s with the rest of state.
 - **Open Positions** — live positions for each symbol with size, entry, PnL,
   margin, ROE.
-- **Dynamic Config** — read-only static block + editable form for the five
-  whitelisted fields (`TRADE_SIZE_MULTIPLIER`, `DAILY_LOSS_LIMIT`,
+- **Dynamic Config** — read-only static block + editable form for whitelisted
+  fields (`TRADE_SIZE_MULTIPLIER`, `DAILY_LOSS_LIMIT`, `AUTO_TAKE_PROFIT_PCT`,
   `TRADE_GATE_ENABLED`, `AUTO_CAPITAL_TUNE`, `AUTO_STRATEGY_EVOLVE`).
 - **AI Capital Suggestion** — the latest `suggested_capital` from `ai_analyst`
   with score, confidence, reason, and an Apply button (disabled if already
@@ -328,6 +347,10 @@ Sections:
     green for positive bars, red for negative, tooltip with trade count and
     win rate.
   Range selector: 1d / 7d / 30d / 90d.
+- **Decision History** — DataTables log sourced from `data/judgments.jsonl`.
+  Columns: 時間 / 幣種 / 決策 / RSI / EMA趨勢 / BB位置 / F&G / AI分數 / Gate /
+  觸發原因. Sortable, searchable, paginated. Shows every tick decision
+  including HOLDs, so you can see exactly what the bot saw and why it held.
 - **Recent Trades** — latest 50 records, click any row to expand its full
   `decision_context` or `exit_context` as JSON.
 - **Download Journal** — header button streams a zip of all retained JSONL
@@ -418,36 +441,66 @@ When `AUTO_CAPITAL_TUNE=false` (default), this mapping is written to
 `ai_meta.suggested_capital` **without** touching live `TRADE_SIZE_MULTIPLIER`
 or `DAILY_LOSS_LIMIT`. The dashboard's Apply button promotes it to live.
 
-### B. Composite signal (every tick) — `strategy.decide()`
+### B. Mean-reversion signal (every tick) — `strategy.decide()`
+
+The strategy is purely **contrarian / mean-reversion**: it enters when price
+has overextended and technical conditions confirm exhaustion. The Fear & Greed
+Index acts as a dual directional filter aligned with the contrarian logic.
 
 ```
 For each symbol on every 60s tick:
-  ema_fast = EMA(closes, EMA_FAST_PERIOD)         # default 9
-  ema_slow = EMA(closes, EMA_SLOW_PERIOD)         # default 21
+  closes   = last 100 × 15m candles from Hyperliquid
   rsi      = RSI(closes, 14)
-  upper, mid, lower = Bollinger(closes, BB_PERIOD, BB_STDEV)  # default 20, 2σ
-  ema_trend = "BULL" if ema_fast > ema_slow else "BEAR"
+  upper, mid, lower = Bollinger(closes, BB_PERIOD=20, BB_STDEV=2.0)
+  fng      = ai_meta.last_fng.value   # updated every 15 min; None if unavailable
+  ema_fast = EMA(closes, 9)           # computed for context/logging — not a gate
+  ema_slow = EMA(closes, 21)          # computed for context/logging — not a gate
 
-  BUY  if ema_trend == "BULL" and (rsi < RSI_OVERSOLD   or  close < lower)
-  SELL if ema_trend == "BEAR" and (rsi > RSI_OVERBOUGHT or  close > upper)
+  BUY  if close < lower  AND  rsi < RSI_OVERSOLD(30)  AND  (fng is None OR fng < 40)
+  SELL if close > upper  AND  rsi > RSI_OVERBOUGHT(70) AND  (fng is None OR fng > 60)
   else HOLD
+
+  # F&G dual filter rationale (contrarian — fade the crowd):
+  #   BUY  blocked when F&G >= 40 → market not fearful enough; no bottom yet
+  #   SELL blocked when F&G <= 60 → market not greedy enough; no top yet
+  #   F&G None                    → filter skipped (API unavailable)
 ```
 
-All thresholds shown read from `strategy_overrides` first, then `config.py`.
-The journal records the **effective** values used for each entry under
-`decision_context.config_snapshot`, so reviews aren't confused by mid-period
-changes.
+**Left-side averaging** — when a new BUY/SELL aligns with an existing same-
+direction position the bot *adds* to the position instead of blocking the
+signal. Individual adds are sized to fill the remaining room up to the notional
+cap: `base_usd × TRADE_SIZE_MULTIPLIER × MAX_POSITION_MULTIPLIER (3)`. Once
+the cap is reached the signal is silently skipped until the position is closed.
+An opposite signal causes an immediate FLIP (EXIT + new order).
 
-### C. Trailing stop (every tick) — runs before signal evaluation
+All thresholds read from `strategy_overrides` in `config.json` first, then
+`config.py`. The journal records the **effective** values used per entry under
+`decision_context.config_snapshot`.
+
+### C. Exit mechanisms (every tick — checked before signal evaluation)
+
+Three layers run in priority order on every tick:
+
+**1. Auto take-profit** (first)
+```
+if ROE >= AUTO_TAKE_PROFIT_PCT (default 10%):
+    close position at market
+    EXIT record → exit_reason: "take_profit"
+    return (skip rest of tick for this symbol)
+```
+
+**2. Trailing stop tiers** (second, only if take-profit did not fire)
 
 | Max ROE seen | Armed floor | Behaviour |
 |---|---|---|
-| ≥ +15% | breakeven (0%) | Position closes if ROE drops to 0% |
-| ≥ +30% | +15% lock-in | Position closes if ROE drops to +15% |
+| ≥ +15% | breakeven (0%) | Close if ROE drops to 0% |
+| ≥ +30% | +15% lock-in | Close if ROE drops to +15% |
 
 ROE is `unrealizedPnl / marginUsed × 100` using Hyperliquid's own fields, so
-leverage is reflected. Triggers write an EXIT to the journal with
-`exit_reason: "trailing_stop"` *before* the close is sent.
+leverage is reflected. Triggers write an EXIT with `exit_reason: "trailing_stop"`.
+
+**3. Kill switch / manual close** — `risk.py` drawdown limit or dashboard
+close button, `exit_reason: "kill_switch"` or `"manual_close"`.
 
 ### D. Trade gate (every entry signal) — `trade_gate.judge_trade()`
 
@@ -568,15 +621,22 @@ sudo journalctl -u bot -u dashboard -f
 ## Strategy swap
 
 The only function you need to change to swap strategies is
-`strategy.decide(closes, settings) -> (Signal, info_dict)`. Keep the
-signature; return one of `"BUY"` / `"SELL"` / `"HOLD"`.
+`strategy.decide(closes, settings, fng_value=None) -> (Signal, info_dict)`.
+Keep the signature; return one of `"BUY"` / `"SELL"` / `"HOLD"`.
 
-The current implementation is a composite EMA(9/21) trend filter + RSI(14)
-extremes 25/75 OR Bollinger(20, 2σ) breakouts. The trade gate prompt expects
-`info["ema_trend"]`, `info["bb_position"]`, and `info["trigger"]`; if your
-replacement preserves those, the gate's regime reasoning keeps working. The
-journal expects `info["params_used"]` to record the effective parameter set
-for each entry — populate it if you want full forensic attribution.
+The current implementation is a **mean-reversion** strategy: BB lower break +
+RSI oversold → BUY (only when F&G < 40); BB upper break + RSI overbought →
+SELL (only when F&G > 60). EMA(9/21) is still computed and included in `info`
+for logging and reviewer context but does **not** gate entries.
+
+The trade gate prompt reads `info["ema_trend"]`, `info["bb_position"]`, and
+`info["trigger"]`; if your replacement preserves those keys the gate's regime
+reasoning keeps working. The journal also reads `info["params_used"]` to
+record the effective parameter set for forensic attribution — populate it if
+you want full traceability.
+
+`info["fng_value"]` is written to every judgment log entry — pass it through
+if your strategy uses the Fear & Greed index.
 
 ---
 
