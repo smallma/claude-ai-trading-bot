@@ -23,9 +23,14 @@ from logger import get_logger
 log = get_logger("journal")
 
 JOURNAL_DIR = Path(__file__).parent / "journal"
+JUDGMENTS_DIR = Path(__file__).parent / "data"
+JUDGMENTS_FILE = JUDGMENTS_DIR / "judgments.jsonl"
+JUDGMENTS_MAX_LINES = 10_000
+JUDGMENTS_KEEP_LINES = 5_000
 RETENTION_MONTHS = 6
 
 _LOCK = threading.Lock()
+_JUDGMENT_LOCK = threading.Lock()
 _FILE_RE = re.compile(r"journal-(\d{6})\.jsonl$")
 _EQUITY_FILE_RE = re.compile(r"equity-(\d{6})\.jsonl$")
 
@@ -138,6 +143,81 @@ def iter_equity(since: Optional[datetime] = None):
                     yield rec
         except OSError as e:
             log.warning(f"Could not read {p.name}: {e}")
+
+
+def log_judgment(symbol: str, decision: str, info: dict[str, Any],
+                 ai_score: Any = None, gate_result: Optional[str] = None,
+                 gate_reason: Optional[str] = None) -> None:
+    """Append one judgment record to data/judgments.jsonl.
+
+    Called for EVERY outcome in _process_symbol: HOLD, SKIP (gate rejected),
+    and BUY/SELL (executed). Auto-truncates when the file exceeds
+    JUDGMENTS_MAX_LINES to keep disk bounded.
+    """
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "decision": decision,
+        "rsi": info.get("rsi"),
+        "ema_trend": info.get("ema_trend"),
+        "ema_spread_pct": info.get("ema_spread_pct"),
+        "bb_position": info.get("bb_position"),
+        "trigger": info.get("trigger"),
+        "ai_score": ai_score,
+        "gate_result": gate_result,
+        "gate_reason": gate_reason,
+    }
+    try:
+        JUDGMENTS_DIR.mkdir(exist_ok=True)
+        line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
+        with _JUDGMENT_LOCK:
+            with JUDGMENTS_FILE.open("a", encoding="utf-8") as f:
+                f.write(line)
+            _maybe_truncate_judgments()
+    except Exception as e:
+        log.error(f"journal.log_judgment failed for {symbol}: {e}")
+
+
+def _maybe_truncate_judgments() -> None:
+    """If judgments.jsonl exceeds JUDGMENTS_MAX_LINES, keep the newest
+    JUDGMENTS_KEEP_LINES. Caller must already hold _JUDGMENT_LOCK."""
+    try:
+        if not JUDGMENTS_FILE.exists():
+            return
+        with JUDGMENTS_FILE.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= JUDGMENTS_MAX_LINES:
+            return
+        keep = lines[-JUDGMENTS_KEEP_LINES:]
+        tmp = JUDGMENTS_FILE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.writelines(keep)
+        tmp.replace(JUDGMENTS_FILE)
+        log.info(f"Truncated judgments.jsonl: {len(lines)} -> {len(keep)} lines")
+    except Exception as e:
+        log.warning(f"judgments truncation failed: {e}")
+
+
+def iter_judgments(limit: int = 1000) -> list[dict[str, Any]]:
+    """Return the last `limit` judgment records, newest-first."""
+    if not JUDGMENTS_FILE.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        with JUDGMENTS_FILE.open("r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    records.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as e:
+        log.warning(f"Could not read judgments: {e}")
+        return []
+    # Return newest first, capped at limit.
+    return records[-limit:][::-1]
 
 
 def purge_old(months: int = RETENTION_MONTHS) -> int:

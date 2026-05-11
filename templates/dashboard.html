@@ -6,6 +6,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css">
+<script src="https://code.jquery.com/jquery-3.7.1.slim.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
 <style>
   :root {
     --bg: #0e1117; --panel: #161b22; --border: #30363d;
@@ -86,6 +89,36 @@
   .seg button { background: transparent; color: var(--muted); border: 0; border-radius: 0;
                 padding: 4px 10px; font-size: 12px; }
   .seg button.active { background: var(--accent); color: #0d1117; }
+
+  /* DataTables dark theme overrides */
+  .dataTables_wrapper { color: var(--fg); }
+  .dataTables_wrapper .dataTables_length select,
+  .dataTables_wrapper .dataTables_filter input {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; }
+  .dataTables_wrapper .dataTables_info,
+  .dataTables_wrapper .dataTables_length,
+  .dataTables_wrapper .dataTables_filter { color: var(--muted); font-size: 12px; }
+  .dataTables_wrapper .dataTables_paginate .paginate_button {
+    color: var(--muted) !important; border: 1px solid var(--border) !important;
+    background: var(--panel) !important; border-radius: 4px !important; margin: 0 2px; }
+  .dataTables_wrapper .dataTables_paginate .paginate_button.current {
+    color: #0d1117 !important; background: var(--accent) !important;
+    border-color: var(--accent) !important; }
+  .dataTables_wrapper .dataTables_paginate .paginate_button:hover {
+    color: var(--fg) !important; background: var(--border) !important; }
+  .dataTables_wrapper .dataTables_paginate .paginate_button.disabled {
+    color: var(--border) !important; }
+  table.dataTable { border-collapse: collapse !important; }
+  table.dataTable thead th { border-bottom: 1px solid var(--border) !important;
+    color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  table.dataTable tbody td { border-bottom: 1px solid var(--border) !important;
+    padding: 6px 8px; font-size: 13px; }
+  table.dataTable tbody tr:hover { background: rgba(255,255,255,0.03) !important; }
+  table.dataTable.no-footer { border-bottom: none !important; }
+  .pill.buy { background: rgba(63,185,80,0.15); color: var(--green); }
+  .pill.sell { background: rgba(248,81,73,0.15); color: var(--red); }
+  .pill.hold { background: rgba(139,148,158,0.15); color: var(--muted); }
 </style>
 </head>
 <body>
@@ -180,6 +213,27 @@
         <th>ROE / PnL</th>
       </tr></thead>
       <tbody id="trades-body"></tbody>
+    </table>
+  </section>
+
+  <section class="panel" style="grid-column: 1 / -1">
+    <div class="row" style="justify-content:space-between; align-items:center">
+      <h2 style="margin:0">Decision History</h2>
+      <button class="secondary" onclick="loadJudgments()">Refresh</button>
+    </div>
+    <table id="judgments-table" class="display" style="width:100%; font-size: 0.9em;">
+      <thead><tr>
+        <th>時間</th>
+        <th>幣種</th>
+        <th>決策</th>
+        <th>RSI</th>
+        <th>EMA 趨勢</th>
+        <th>BB 位置</th>
+        <th>AI 分數</th>
+        <th>Gate</th>
+        <th>觸發原因</th>
+      </tr></thead>
+      <tbody></tbody>
     </table>
   </section>
 </main>
@@ -1099,9 +1153,68 @@ document.querySelectorAll("#range-seg button").forEach(btn => {
 
 refresh();
 loadCharts(_chartRangeDays);
+loadJudgments();
 setInterval(refresh, 30000);
 // Charts refresh less often — equity log writes every 5 min anyway.
 setInterval(() => loadCharts(_chartRangeDays), 5 * 60 * 1000);
+// Judgments refresh every 2 min.
+setInterval(loadJudgments, 2 * 60 * 1000);
+
+// ========== Decision History (DataTables) ==========
+let _judgmentsTable = null;
+
+function _decisionPill(d) {
+  if (!d) return "—";
+  const cls = d === "BUY" ? "buy" : d === "SELL" ? "sell" : d === "SKIP" ? "skip" : "hold";
+  return `<span class="pill ${cls}">${d}</span>`;
+}
+
+async function loadJudgments() {
+  try {
+    const r = await fetch("/api/judgments?limit=2000");
+    const j = await r.json();
+    if (!j.ok) return;
+    const data = (j.records || []).map(rec => [
+      fmtTs(rec.ts),
+      rec.symbol || "—",
+      rec.decision || "—",
+      rec.rsi != null ? Number(rec.rsi).toFixed(1) : "—",
+      rec.ema_trend || "—",
+      rec.bb_position || "—",
+      rec.ai_score != null ? Number(rec.ai_score).toFixed(1) : "—",
+      rec.gate_result || "—",
+      rec.trigger || rec.gate_reason || "—",
+    ]);
+
+    if (_judgmentsTable) {
+      _judgmentsTable.clear();
+      _judgmentsTable.rows.add(data);
+      _judgmentsTable.draw(false);
+    } else {
+      _judgmentsTable = jQuery("#judgments-table").DataTable({
+        data: data,
+        order: [[0, "desc"]],
+        pageLength: 25,
+        lengthMenu: [10, 25, 50, 100],
+        language: {
+          search: "搜尋：",
+          lengthMenu: "每頁 _MENU_ 筆",
+          info: "第 _START_ 到 _END_ 筆（共 _TOTAL_ 筆）",
+          paginate: { first: "«", previous: "‹", next: "›", last: "»" },
+          emptyTable: "尚無決策記錄",
+          zeroRecords: "找不到符合的記錄",
+        },
+        columnDefs: [
+          { targets: 2, render: (d) => _decisionPill(d) },
+          { targets: [3, 6], className: "dt-right" },
+        ],
+        deferRender: true,
+      });
+    }
+  } catch (e) {
+    console.error("loadJudgments failed:", e);
+  }
+}
 </script>
 </body>
 </html>

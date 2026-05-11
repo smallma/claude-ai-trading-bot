@@ -507,11 +507,14 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
 
     signal, info = decide(closes, current_settings)
 
+    _ai_score = (ai_meta or {}).get("last_sentiment")
+
     if signal == "HOLD":
         log.info(
             f"[{symbol}] HOLD | RSI={info['rsi']} EMA{config.EMA_FAST_PERIOD}/{config.EMA_SLOW_PERIOD}={info['ema_trend']} "
             f"BB={info['bb_position']}"
         )
+        journal.log_judgment(symbol, "HOLD", info, ai_score=_ai_score)
         return
 
     log.info(
@@ -554,6 +557,8 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
         allow, source, reason, gate_votes = trade_gate.judge_trade(signal, gate_ctx)
         if not allow:
             log.info(f"[{symbol}] Trade gate SKIP via {source}: {reason}")
+            journal.log_judgment(symbol, "SKIP", info, ai_score=_ai_score,
+                                 gate_result="REJECT", gate_reason=reason)
             return
 
     decision_context = _build_decision_context(
@@ -566,6 +571,8 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
         current_settings=current_settings,
         ai_meta=ai_meta,
     )
+    journal.log_judgment(symbol, signal, info, ai_score=_ai_score,
+                         gate_result="GO" if gate_enabled else None)
     execute_signal(client, symbol, signal, trade_size, decision_context)
 
 

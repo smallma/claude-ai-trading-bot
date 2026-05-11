@@ -909,6 +909,21 @@ def api_download():
     return send_file(buf, download_name=fname, mimetype="application/zip", as_attachment=True)
 
 
+@app.route("/api/judgments")
+def api_judgments():
+    """Return recent decision-history records (HOLD / SKIP / BUY / SELL).
+
+    Query: ?limit=N (1-5000, default 1000). Newest-first.
+    """
+    try:
+        limit = int(request.args.get("limit", 1000))
+    except (TypeError, ValueError):
+        limit = 1000
+    limit = max(1, min(5000, limit))
+    records = journal.iter_judgments(limit=limit)
+    return jsonify({"ok": True, "count": len(records), "records": records})
+
+
 if __name__ == "__main__":
     # Loopback only — Caddy in front handles TLS + Basic Auth.
     app.run(host="127.0.0.1", port=int(os.getenv("DASHBOARD_PORT", "8080")), debug=False)
