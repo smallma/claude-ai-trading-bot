@@ -105,13 +105,20 @@ class HyperliquidClient:
             raise RuntimeError(f"No mid price returned for {symbol}")
         return float(price)
 
+    @staticmethod
+    def _interval_to_ms(interval: str) -> int:
+        """Convert candle interval string (e.g. '1m', '15m', '1h') to milliseconds."""
+        units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+        suffix = interval[-1]
+        num = int(interval[:-1])
+        return num * units.get(suffix, 60_000)
+
     def get_recent_closes(self, symbol: str, interval: str, lookback: int) -> list[float]:
         # Hyperliquid candle endpoint expects ms timestamps.
         # Pull a generous window to ensure we get >= lookback candles.
         end_ms = int(time.time() * 1000)
-        # 1m * lookback * 2 to be safe against gaps.
-        minute_ms = 60 * 1000
-        start_ms = end_ms - (lookback * 2 * minute_ms)
+        interval_ms = self._interval_to_ms(interval)
+        start_ms = end_ms - (lookback * 2 * interval_ms)
         candles = self.info.candles_snapshot(symbol, interval, start_ms, end_ms)
         closes = [float(c["c"]) for c in candles]
         return closes[-lookback:]

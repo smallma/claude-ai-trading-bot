@@ -94,10 +94,10 @@ def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]
     bb_upper, bb_mid, bb_lower = _bbands(closes, bb_period, bb_stdev)
     last_close = closes[-1]
 
-    # EMA spread threshold: require >0.15% gap to declare a trend.
+    # EMA spread threshold: require >0.05% gap to declare a trend.
     # If fast/slow are too close ("glued"), force FLAT to avoid false breakouts.
     ema_spread = abs(ema_fast - ema_slow) / ema_slow if ema_slow != 0 else 0.0
-    EMA_SPREAD_THRESHOLD = 0.0015  # 0.15%
+    EMA_SPREAD_THRESHOLD = 0.0005  # 0.05%
     if ema_spread < EMA_SPREAD_THRESHOLD:
         ema_trend = "FLAT"
     elif ema_fast > ema_slow:

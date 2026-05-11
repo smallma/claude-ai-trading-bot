@@ -32,15 +32,15 @@ NEW_SYMBOL_DEFAULT_LEVERAGE = 20
 MAX_OPEN_POSITIONS_PER_SYMBOL = 1
 
 LOOP_SECONDS = 60
-CANDLE_INTERVAL = "1m"
+CANDLE_INTERVAL = "15m"
 CANDLE_LOOKBACK = 100
 
 RSI_PERIOD = 14
 
 # RSI thresholds are LOCKED — AI cannot tune them. Only triggers entries when
 # the market is at a true extreme. Same for all symbols.
-RSI_OVERSOLD = 25.0
-RSI_OVERBOUGHT = 75.0
+RSI_OVERSOLD = 30.0
+RSI_OVERBOUGHT = 70.0
 
 # EMA trend filter (fast vs slow). EMA_FAST > EMA_SLOW = bull regime.
 EMA_FAST_PERIOD = 9
