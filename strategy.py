@@ -1,11 +1,12 @@
-"""Composite strategy: EMA trend filter + (RSI extreme OR Bollinger breakout).
+"""Mean-reversion strategy: Bollinger breakout + RSI extreme + F&G dual filter.
 
-decide(closes, settings) -> ("BUY"|"SELL"|"HOLD", info_dict)
+decide(closes, settings, fng_value) -> ("BUY"|"SELL"|"HOLD", info_dict)
 
-BUY  : EMA9 > EMA21  AND  (RSI < RSI_OVERSOLD   OR  close < BB_LOWER)
-SELL : EMA9 < EMA21  AND  (RSI > RSI_OVERBOUGHT OR  close > BB_UPPER)
+BUY  : close < BB_LOWER  AND  RSI < RSI_OVERSOLD  AND  F&G < 40  (fear)
+SELL : close > BB_UPPER  AND  RSI > RSI_OVERBOUGHT AND  F&G > 60  (greed)
 HOLD : otherwise
 
+EMA trend is computed for logging/context only — no longer blocks entries.
 Pure-Python implementations to avoid the pandas-ta dependency.
 """
 from typing import Any, Literal, Optional
@@ -80,7 +81,8 @@ def _ov(settings: dict[str, Any], key: str, default: Any) -> Any:
     return val if val is not None else default
 
 
-def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]:
+def decide(closes: list[float], settings: dict[str, Any],
+           fng_value: Optional[int] = None) -> tuple[Signal, dict]:
     rsi_oversold_thr = float(_ov(settings, "RSI_OVERSOLD", config.RSI_OVERSOLD))
     rsi_overbought_thr = float(_ov(settings, "RSI_OVERBOUGHT", config.RSI_OVERBOUGHT))
     ema_fast_period = int(_ov(settings, "EMA_FAST_PERIOD", config.EMA_FAST_PERIOD))
@@ -126,33 +128,34 @@ def decide(closes: list[float], settings: dict[str, Any]) -> tuple[Signal, dict]
             "BB_PERIOD": bb_period,
             "BB_STDEV": bb_stdev,
         },
+        "fng_value": fng_value,
     }
+
+    # F&G dual filter thresholds for mean-reversion:
+    #   BUY only when crowd is fearful (F&G < 40)
+    #   SELL only when crowd is greedy (F&G > 60)
+    FNG_BUY_CEILING = 40
+    FNG_SELL_FLOOR = 60
 
     rsi_oversold = rsi < rsi_oversold_thr
     rsi_overbought = rsi > rsi_overbought_thr
     bb_break_low = last_close < bb_lower
     bb_break_high = last_close > bb_upper
 
-    # EMA FLAT = consolidation -> no entries
-    if ema_trend == "FLAT":
-        return "HOLD", info
+    # --- Mean-reversion BUY: BB lower break + RSI oversold + F&G fear ---
+    if bb_break_low and rsi_oversold:
+        if fng_value is not None and fng_value >= FNG_BUY_CEILING:
+            info["trigger"] = f"F&G >= {FNG_BUY_CEILING} (Too High for BUY)"
+            return "HOLD", info
+        info["trigger"] = "BB lower break + RSI oversold"
+        return "BUY", info
 
-    if ema_trend == "BULL":
-        if rsi_oversold:
-            info["trigger"] = "RSI oversold"
-            return "BUY", info
-        # BB lower break requires RSI dual confirmation (prevent catching knives)
-        if bb_break_low and rsi_oversold:
-            info["trigger"] = "BB lower break + RSI confirm"
-            return "BUY", info
-
-    if ema_trend == "BEAR":
-        if rsi_overbought:
-            info["trigger"] = "RSI overbought"
-            return "SELL", info
-        # BB upper break requires RSI dual confirmation
-        if bb_break_high and rsi_overbought:
-            info["trigger"] = "BB upper break + RSI confirm"
-            return "SELL", info
+    # --- Mean-reversion SELL: BB upper break + RSI overbought + F&G greed ---
+    if bb_break_high and rsi_overbought:
+        if fng_value is not None and fng_value <= FNG_SELL_FLOOR:
+            info["trigger"] = f"F&G <= {FNG_SELL_FLOOR} (Not Greedy Enough for SELL)"
+            return "HOLD", info
+        info["trigger"] = "BB upper break + RSI overbought"
+        return "SELL", info
 
     return "HOLD", info

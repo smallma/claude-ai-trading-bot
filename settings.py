@@ -17,6 +17,9 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 DEFAULTS: dict[str, Any] = {
     "TRADE_SIZE_MULTIPLIER": 1.0,
     "DAILY_LOSS_LIMIT": 0.02,
+    # Auto take-profit: close position when ROE% reaches this threshold.
+    # Applies to both long and short. Dashboard-editable via config.json.
+    "AUTO_TAKE_PROFIT_PCT": 10.0,
     # Approval gates — when False, AI/reviewer write SUGGESTIONS into ai_meta
     # and wait for the dashboard operator to apply them. When True, changes
     # take effect automatically.

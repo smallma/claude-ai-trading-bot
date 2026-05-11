@@ -155,56 +155,88 @@ def _journal_exit_before_close(
 
 def execute_signal(client: HyperliquidClient, symbol: str, signal: str,
                    trade_size_usd: float, decision_context: dict) -> None:
-    """Bring net position in `symbol` to ±trade_size_usd.
+    """Place an order for `symbol` in the direction of `signal`.
 
-    On FLIP we journal the existing position as an EXIT (reason
-    "opposite_signal") before placing the flip order. On any successful order
-    we journal a new ENTRY and stash entry meta in `_position_entry_meta` so
-    the matching EXIT can carry trade_id, entry_price and hold time later.
+    Supports three scenarios:
+    1. FLAT → open a new position (BUY or SELL).
+    2. Same direction → add to existing position (left-side averaging),
+       guarded by MAX_POSITION_MULTIPLIER to prevent unlimited stacking.
+    3. Opposite direction (FLIP) → journal EXIT on old position, then open new.
+
+    On any successful order we journal a new ENTRY and stash entry meta in
+    `_position_entry_meta` so the matching EXIT can carry trade_id later.
     """
     pos = client.get_open_position(symbol)
     current_size = float(pos["szi"]) if pos else 0.0
     price = client.get_mid_price(symbol)
 
-    target_usd = trade_size_usd if signal == "BUY" else -trade_size_usd
-    target_size = target_usd / price
-    delta_size = target_size - current_size
+    is_same_direction = (
+        (signal == "BUY" and current_size > 0) or
+        (signal == "SELL" and current_size < 0)
+    )
 
-    if abs(delta_size * price) < 1.0:
-        log.info(
-            f"[{symbol}] already at target {signal} "
-            f"(current={current_size:.4f}, target={target_size:.4f}); no order."
-        )
-        return
-
-    is_buy = delta_size > 0
-    order_size = abs(delta_size)
-    notional = order_size * price
-
-    is_flip = current_size != 0 and ((current_size > 0) != (target_size > 0))
-    if is_flip:
-        log.info(
-            f"[{symbol}] FLIP: {current_size:.4f} -> {target_size:.4f} "
-            f"({'BUY' if is_buy else 'SELL'} {order_size:.4f}, ~${notional:.2f})"
-        )
-        # Journal the existing position as an EXIT before the flip lands.
-        try:
-            roe = _compute_roe_pct(pos) if pos else None
-            max_roe = _position_max_roe.get(symbol, roe)
-            min_roe = _position_min_roe.get(symbol, roe)
-            _journal_exit_before_close(
-                client, symbol, pos or {}, "opposite_signal",
-                max_roe, min_roe, roe, exit_price=price,
+    # --- Same-direction add: check MAX_POSITION_MULTIPLIER guard ---
+    if is_same_direction:
+        max_notional = trade_size_usd * config.MAX_POSITION_MULTIPLIER
+        current_notional = abs(current_size) * price
+        if current_notional >= max_notional:
+            log.warning(
+                f"[{symbol}] ADD blocked: current ${current_notional:.2f} "
+                f">= max ${max_notional:.2f} "
+                f"(base×mult×{config.MAX_POSITION_MULTIPLIER}); skipping."
             )
-        except Exception as e:
-            log.warning(f"[{symbol}] flip EXIT journal failed: {e}")
-        _position_max_roe.pop(symbol, None)
-        _position_min_roe.pop(symbol, None)
-    else:
+            return
+        # Order only 1× trade_size_usd increment (not the full target)
+        order_notional = min(trade_size_usd, max_notional - current_notional)
+        order_size = order_notional / price
+        is_buy = signal == "BUY"
         log.info(
-            f"[{symbol}] OPEN: target={target_size:.4f} "
-            f"({'BUY' if is_buy else 'SELL'} {order_size:.4f}, ~${notional:.2f})"
+            f"[{symbol}] ADD to {('LONG' if current_size > 0 else 'SHORT')}: "
+            f"+{'BUY' if is_buy else 'SELL'} {order_size:.4f} (~${order_notional:.2f}), "
+            f"current ${current_notional:.2f} / max ${max_notional:.2f}"
         )
+    else:
+        # New position or flip
+        target_usd = trade_size_usd if signal == "BUY" else -trade_size_usd
+        target_size = target_usd / price
+        delta_size = target_size - current_size
+
+        if abs(delta_size * price) < 1.0:
+            log.info(
+                f"[{symbol}] already at target {signal} "
+                f"(current={current_size:.4f}, target={target_size:.4f}); no order."
+            )
+            return
+
+        is_buy = delta_size > 0
+        order_size = abs(delta_size)
+        order_notional = order_size * price
+
+        is_flip = current_size != 0 and ((current_size > 0) != (target_size > 0))
+        if is_flip:
+            log.info(
+                f"[{symbol}] FLIP: {current_size:.4f} -> {target_size:.4f} "
+                f"({'BUY' if is_buy else 'SELL'} {order_size:.4f}, ~${order_notional:.2f})"
+            )
+            try:
+                roe = _compute_roe_pct(pos) if pos else None
+                max_roe = _position_max_roe.get(symbol, roe)
+                min_roe = _position_min_roe.get(symbol, roe)
+                _journal_exit_before_close(
+                    client, symbol, pos or {}, "opposite_signal",
+                    max_roe, min_roe, roe, exit_price=price,
+                )
+            except Exception as e:
+                log.warning(f"[{symbol}] flip EXIT journal failed: {e}")
+            _position_max_roe.pop(symbol, None)
+            _position_min_roe.pop(symbol, None)
+        else:
+            log.info(
+                f"[{symbol}] OPEN: target={target_size:.4f} "
+                f"({'BUY' if is_buy else 'SELL'} {order_size:.4f}, ~${order_notional:.2f})"
+            )
+
+    notional = order_size * price
 
     # client.market_open raises on:
     #   - HTTP / SDK transport errors
@@ -457,8 +489,8 @@ def _check_trailing_stop(symbol: str, roe: float) -> Optional[tuple[float, float
 
 def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
                     current_settings: dict[str, Any], ai_meta: dict[str, Any]) -> None:
-    """One symbol per tick: trailing-stop check -> compute signal -> gate -> execute."""
-    # 1. Trailing stop check — runs every tick regardless of signal.
+    """One symbol per tick: take-profit -> trailing-stop -> compute signal -> gate -> execute."""
+    # 1. Position checks — runs every tick regardless of signal.
     try:
         pos = client.get_open_position(symbol)
     except Exception as e:
@@ -475,6 +507,28 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
     else:
         roe = _compute_roe_pct(pos)
         if roe is not None:
+            # 1a. Auto take-profit — fires BEFORE trailing stop.
+            tp_pct = float(current_settings.get("AUTO_TAKE_PROFIT_PCT", 10.0))
+            if roe >= tp_pct:
+                max_seen = _position_max_roe.get(symbol, roe)
+                min_seen = _position_min_roe.get(symbol, roe)
+                log.warning(
+                    f"[{symbol}] [Take Profit] ROE {roe:+.2f}% >= "
+                    f"{tp_pct:+.2f}% threshold; closing position."
+                )
+                _journal_exit_before_close(
+                    client, symbol, pos, "take_profit",
+                    max_seen, min_seen, roe,
+                )
+                try:
+                    client.market_close(symbol)
+                except Exception as e:
+                    log.error(f"[{symbol}] take-profit close failed: {e}")
+                _position_max_roe.pop(symbol, None)
+                _position_min_roe.pop(symbol, None)
+                return
+
+            # 1b. Trailing stop check.
             triggered = _check_trailing_stop(symbol, roe)
             if triggered:
                 max_seen, floor = triggered
@@ -505,7 +559,8 @@ def _process_symbol(client: HyperliquidClient, kill: KillSwitch, symbol: str,
         log.warning(f"[{symbol}] not enough candles ({len(closes)}); skipping.")
         return
 
-    signal, info = decide(closes, current_settings)
+    signal, info = decide(closes, current_settings,
+                         fng_value=((ai_meta or {}).get("last_fng") or {}).get("value"))
 
     _ai_score = (ai_meta or {}).get("last_sentiment")
 

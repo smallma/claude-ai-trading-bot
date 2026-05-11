@@ -31,6 +31,11 @@ NEW_SYMBOL_DEFAULT_LEVERAGE = 20
 # Max simultaneous open positions PER SYMBOL (each symbol tracked independently).
 MAX_OPEN_POSITIONS_PER_SYMBOL = 1
 
+# Max allowed position size as a multiple of base_usd * TRADE_SIZE_MULTIPLIER.
+# Prevents unlimited averaging-down / averaging-up. E.g. 3 means the bot can
+# add to a position up to 3× the single-entry notional before refusing more.
+MAX_POSITION_MULTIPLIER = 3
+
 LOOP_SECONDS = 60
 CANDLE_INTERVAL = "15m"
 CANDLE_LOOKBACK = 100

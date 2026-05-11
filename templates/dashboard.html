@@ -119,6 +119,19 @@
   .pill.buy { background: rgba(63,185,80,0.15); color: var(--green); }
   .pill.sell { background: rgba(248,81,73,0.15); color: var(--red); }
   .pill.hold { background: rgba(139,148,158,0.15); color: var(--muted); }
+
+  /* F&G Gauge */
+  .fng-gauge { display: flex; align-items: center; gap: 14px; padding: 10px 14px;
+               border-radius: 8px; border: 1px solid var(--border); background: var(--panel); }
+  .fng-value { font-size: 32px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .fng-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .fng-bar { flex: 1; height: 8px; border-radius: 4px; position: relative;
+             background: linear-gradient(to right, #3fb950 0%, #d29922 50%, #f85149 100%); }
+  .fng-bar .marker { position: absolute; top: -4px; width: 4px; height: 16px;
+                     background: var(--fg); border-radius: 2px; }
+  .fng-meta { font-size: 11px; color: var(--muted); }
+  .fng-buy-ok { color: var(--green); }
+  .fng-buy-blocked { color: var(--red); }
 </style>
 </head>
 <body>
@@ -133,6 +146,7 @@
 <main>
   <section class="panel">
     <h2>Open Positions</h2>
+    <div id="fng-gauge" class="fng-gauge" style="margin-bottom: 12px;"></div>
     <div id="positions" class="pos-grid"></div>
     <div class="row small muted" style="margin-top:10px">
       <span>Equity:</span><span id="equity">—</span>
@@ -229,6 +243,7 @@
         <th>RSI</th>
         <th>EMA 趨勢</th>
         <th>BB 位置</th>
+        <th>F&G</th>
         <th>AI 分數</th>
         <th>Gate</th>
         <th>觸發原因</th>
@@ -264,6 +279,7 @@ async function refresh() {
     const r = await fetch("/api/state");
     const s = await r.json();
     LAST_STATE = s;
+    renderFnG(s);
     renderPositions(s);
     renderConfig(s);
     renderSuggestion(s);
@@ -277,6 +293,38 @@ async function refresh() {
   } catch (e) {
     toast("refresh failed: " + e, "err");
   }
+}
+
+function renderFnG(s) {
+  const gauge = $("fng-gauge");
+  const meta = (s.config && s.config.ai_meta) || {};
+  const fng = meta.last_fng;
+  if (!fng || fng.value == null) {
+    gauge.innerHTML = `<span class="muted small">Fear & Greed Index: 無資料</span>`;
+    return;
+  }
+  const v = Number(fng.value);
+  const cls = fng.classification || "";
+  // Color: < 40 green (fear = buy zone), 40-60 grey (neutral), > 60 red (greed = sell zone)
+  let color, buyTag;
+  if (v < 40)       { color = "var(--green)";  buyTag = `<span class="fng-buy-ok">● 恐慌區 — 適合做多 (BUY)</span>`; }
+  else if (v <= 60) { color = "var(--muted)";  buyTag = `<span style="color:var(--muted)">— 中性區 — 不觸發進場</span>`; }
+  else              { color = "var(--red)";    buyTag = `<span class="fng-buy-blocked">● 貪婪區 — 適合做空 (SELL)</span>`; }
+  const pct = Math.max(0, Math.min(100, v));
+  gauge.innerHTML = `
+    <div>
+      <div class="fng-label" style="color: var(--muted)">Fear & Greed</div>
+      <div class="fng-value" style="color: ${color}">${v}</div>
+      <div class="fng-meta">${escapeHtml(cls)}</div>
+    </div>
+    <div style="flex:1; display:flex; flex-direction:column; gap:4px">
+      <div class="fng-bar"><div class="marker" style="left: ${pct}%"></div></div>
+      <div class="fng-meta" style="display:flex; justify-content:space-between">
+        <span>0 恐慌 (BUY zone)</span>
+        <span>100 貪婪 (SELL zone)</span>
+      </div>
+      <div class="small">${buyTag}</div>
+    </div>`;
 }
 
 function renderPositions(s) {
@@ -1181,6 +1229,7 @@ async function loadJudgments() {
       rec.rsi != null ? Number(rec.rsi).toFixed(1) : "—",
       rec.ema_trend || "—",
       rec.bb_position || "—",
+      rec.fng_value != null ? String(rec.fng_value) : "—",
       rec.ai_score != null ? Number(rec.ai_score).toFixed(1) : "—",
       rec.gate_result || "—",
       rec.trigger || rec.gate_reason || "—",
@@ -1206,7 +1255,7 @@ async function loadJudgments() {
         },
         columnDefs: [
           { targets: 2, render: (d) => _decisionPill(d) },
-          { targets: [3, 6], className: "dt-right" },
+          { targets: [3, 6, 7], className: "dt-right" },
         ],
         deferRender: true,
       });
